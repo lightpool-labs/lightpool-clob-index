@@ -8,7 +8,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::indexer::index_order_created;
+use crate::indexer::{apply_order_created_to_book, index_order_created};
 use crate::models::{CancelContextResponse, Order};
 use crate::state::AppState;
 
@@ -92,6 +92,11 @@ async fn index_from_event(
     State(state): State<AppState>,
     Json(event): Json<OrderCreatedEvent>,
 ) -> AppResult<Json<Order>> {
+    let chain_order_id = event.order_id.to_string();
+    if !state.index.has_chain_order(&chain_order_id).await {
+        apply_order_created_to_book(&state.book_store, 0, &event).await;
+    }
+
     let order = index_order_created(&state.index, event)
         .await
         .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;

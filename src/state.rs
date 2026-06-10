@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::chain::ChainClient;
 use crate::config::Config;
-use crate::indexer::{IndexStore, SharedIndexStore, SharedIndexedBlockHead, new_head};
+use crate::indexer::{
+    BookStore, IndexStore, SharedBookStore, SharedIndexStore, SharedIndexedBlockHead, new_head,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,6 +12,7 @@ pub struct AppState {
     pub chain: Arc<ChainClient>,
     pub indexed_head: SharedIndexedBlockHead,
     pub index: SharedIndexStore,
+    pub book_store: SharedBookStore,
 }
 
 impl AppState {
@@ -20,6 +23,7 @@ impl AppState {
             chain,
             indexed_head: new_head(),
             index: Arc::new(IndexStore::new()),
+            book_store: Arc::new(BookStore::new()),
         }
     }
 }

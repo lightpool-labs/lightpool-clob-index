@@ -1,3 +1,4 @@
+mod book_store;
 mod processor;
 mod store;
 
@@ -7,7 +8,8 @@ use lightpool_sdk::{Message, Subscription, WebSocketClient};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub use processor::index_order_created;
+pub use book_store::{BookStore, OrderBookDelta, OrderBookSnapshot, SharedBookStore};
+pub use processor::{apply_order_created_to_book, index_order_created};
 pub use store::{
     market_uuid, IndexStore, IndexedBlockHead, SharedIndexStore, SharedIndexedBlockHead, new_head,
 };
@@ -20,10 +22,11 @@ pub fn spawn(
     ws_url: String,
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
+    book_store: SharedBookStore,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match run_once(&ws_url, head.clone(), index.clone()).await {
+            match run_once(&ws_url, head.clone(), index.clone(), book_store.clone()).await {
                 Ok(()) => {
                     tracing::warn!("indexer stream ended, reconnecting in 5s");
                 }
@@ -46,6 +49,7 @@ async fn run_once(
     ws_url: &str,
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
+    book_store: SharedBookStore,
 ) -> AppResult<()> {
     let mut client = WebSocketClient::new(Some(ws_url.to_string()))
         .await
@@ -73,7 +77,7 @@ async fn run_once(
 
                 tracing::info!(block_num, tx_count, "processing block");
 
-                process_block(&index, block).await;
+                process_block(&index, &book_store, block).await;
 
                 let mut state = head.write().await;
                 state.block_num = block_num;

@@ -4,6 +4,7 @@ pub mod markets;
 pub mod orders;
 pub mod spot;
 pub mod tx;
+pub mod ws;
 
 use axum::Router;
 
@@ -17,4 +18,5 @@ pub fn api_router() -> Router<AppState> {
         .nest("/accounts", accounts::router())
         .nest("/orders", orders::router())
         .nest("/tx", tx::router())
+        .nest("/ws", ws::router())
 }

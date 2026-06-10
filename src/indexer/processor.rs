@@ -16,9 +16,16 @@ use uuid::Uuid;
 use crate::chain::{format_price_pieces, format_token_amount};
 use crate::models::{Market, Order};
 
+use super::book_store::SharedBookStore;
 use super::store::{market_uuid, question_from_hash, IndexStore, SharedIndexStore};
 
-pub async fn process_block(store: &SharedIndexStore, block: VerifiedBlock) {
+pub async fn process_block(
+    store: &SharedIndexStore,
+    book_store: &SharedBookStore,
+    block: VerifiedBlock,
+) {
+    let block_num = block.block_num;
+
     for tx_result in block.transaction_outputs {
         log_tx_result(&tx_result);
 
@@ -66,6 +73,10 @@ pub async fn process_block(store: &SharedIndexStore, block: VerifiedBlock) {
                 "order_created" => {
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(created) = bincode::deserialize::<OrderCreatedEvent>(data) {
+                            let chain_order_id = created.order_id.to_string();
+                            if !store.has_chain_order(&chain_order_id).await {
+                                apply_order_created_to_book(book_store, block_num, &created).await;
+                            }
                             index_order_created(store, created).await;
                         }
                     }
@@ -73,18 +84,41 @@ pub async fn process_block(store: &SharedIndexStore, block: VerifiedBlock) {
                 "order_cancelled" => {
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(cancelled) = bincode::deserialize::<OrderCancelledEvent>(data) {
-                            store
-                                .update_order_cancelled(&cancelled.order_id.to_string())
-                                .await;
+                            let chain_order_id = cancelled.order_id.to_string();
+                            if let Some(spot_market) =
+                                store.spot_market_for_chain_order(&chain_order_id).await
+                            {
+                                book_store
+                                    .apply_cancelled(
+                                        &spot_market,
+                                        cancelled.side,
+                                        cancelled.price,
+                                        cancelled.cancelled_amount,
+                                        block_num,
+                                    )
+                                    .await;
+                            }
+                            store.update_order_cancelled(&chain_order_id).await;
                         }
                     }
                 }
                 "order_filled" => {
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(filled) = bincode::deserialize::<OrderFilledEvent>(data) {
-                            let spot_market = filled.market.to_string();
+                            let spot_market =
+                                crate::spot_market::normalize_spot_market_key(&filled.market.to_string());
                             store
                                 .record_last_trade_price(&spot_market, filled.price)
+                                .await;
+                            book_store
+                                .apply_filled(
+                                    &spot_market,
+                                    filled.side,
+                                    filled.price,
+                                    filled.fill_amount,
+                                    block_num,
+                                    filled.price,
+                                )
                                 .await;
                             store
                                 .update_order_fill(
@@ -296,6 +330,29 @@ fn format_event_detail(event: &TransactionEvent) -> String {
     }
 
     format!("{action}: (undecoded)")
+}
+
+pub async fn apply_order_created_to_book(
+    book_store: &SharedBookStore,
+    block_num: u64,
+    created: &OrderCreatedEvent,
+) {
+    let OrderEventType::Limit { price, .. } = &created.order_type else {
+        return;
+    };
+
+    let spot_market =
+        crate::spot_market::normalize_spot_market_key(&created.market.to_string());
+
+    book_store
+        .apply_created(
+            &spot_market,
+            created.side,
+            *price,
+            created.amount,
+            block_num,
+        )
+        .await;
 }
 
 async fn index_market_created(store: &SharedIndexStore, created: EventContractCreatedEvent) {

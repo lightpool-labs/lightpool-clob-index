@@ -1,0 +1,325 @@
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use lightpool_sdk::lightpool_types::call::GetOrderBook;
+use lightpool_sdk::OrderSide;
+use serde::Serialize;
+use tokio::sync::{broadcast, RwLock};
+
+use crate::chain::{format_price_pieces, format_token_amount};
+use crate::models::{BookLevel, BookResponse};
+use crate::spot_market::normalize_spot_market_key;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BookLevelDelta {
+    pub price: String,
+    pub size: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderBookSnapshot {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub spot_market: String,
+    pub sequence: u64,
+    pub bids: Vec<BookLevel>,
+    pub asks: Vec<BookLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_trade_price: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderBookDelta {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub spot_market: String,
+    pub sequence: u64,
+    pub block_num: u64,
+    pub bids: Vec<BookLevelDelta>,
+    pub asks: Vec<BookLevelDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_trade_price: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct SpotBook {
+    bids: BTreeMap<u64, u64>,
+    asks: BTreeMap<u64, u64>,
+    sequence: u64,
+    last_trade_price: Option<u64>,
+}
+
+#[derive(Default)]
+struct BookStoreInner {
+    books: HashMap<String, SpotBook>,
+    publishers: HashMap<String, broadcast::Sender<OrderBookDelta>>,
+}
+
+pub struct BookStore {
+    inner: RwLock<BookStoreInner>,
+}
+
+pub type SharedBookStore = Arc<BookStore>;
+
+impl BookStore {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(BookStoreInner::default()),
+        }
+    }
+
+    fn key(spot_market: &str) -> String {
+        normalize_spot_market_key(spot_market)
+    }
+
+    pub async fn subscribe(&self, spot_market: &str) -> broadcast::Receiver<OrderBookDelta> {
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let sender = inner
+            .publishers
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(256).0);
+        sender.subscribe()
+    }
+
+    pub async fn snapshot(&self, spot_market: &str, depth: u32) -> Option<BookResponse> {
+        let key = Self::key(spot_market);
+        let inner = self.inner.read().await;
+        let book = inner.books.get(&key)?;
+        Some(Self::book_to_response(book, depth))
+    }
+
+    pub async fn ws_snapshot(&self, spot_market: &str, depth: u32) -> Option<OrderBookSnapshot> {
+        let key = Self::key(spot_market);
+        let inner = self.inner.read().await;
+        let book = inner.books.get(&key)?;
+        Some(Self::book_to_ws_snapshot(&key, book, depth))
+    }
+
+    pub async fn is_hydrated(&self, spot_market: &str) -> bool {
+        let key = Self::key(spot_market);
+        self.inner.read().await.books.contains_key(&key)
+    }
+
+    pub async fn hydrate_from_chain(
+        &self,
+        spot_market: &str,
+        chain_book: &GetOrderBook,
+        last_trade_price: Option<u64>,
+    ) {
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let book = inner
+            .books
+            .entry(key)
+            .or_insert_with(SpotBook::default);
+
+        book.bids.clear();
+        book.asks.clear();
+        for level in &chain_book.best_bids {
+            if level.total_quantity > 0 {
+                book.bids.insert(level.price, level.total_quantity);
+            }
+        }
+        for level in &chain_book.best_asks {
+            if level.total_quantity > 0 {
+                book.asks.insert(level.price, level.total_quantity);
+            }
+        }
+        book.sequence = book.sequence.saturating_add(1);
+        if let Some(price) = last_trade_price {
+            book.last_trade_price = Some(price);
+        }
+    }
+
+    pub async fn apply_created(
+        &self,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        amount_raw: u64,
+        block_num: u64,
+    ) {
+        if price_raw == 0 || amount_raw == 0 {
+            return;
+        }
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let delta = Self::apply_level_change(
+            &mut inner,
+            &key,
+            side,
+            price_raw,
+            amount_raw,
+            true,
+            block_num,
+            None,
+        );
+        Self::publish_delta(&inner, delta);
+    }
+
+    pub async fn apply_cancelled(
+        &self,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        amount_raw: u64,
+        block_num: u64,
+    ) {
+        if price_raw == 0 || amount_raw == 0 {
+            return;
+        }
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let delta = Self::apply_level_change(
+            &mut inner,
+            &key,
+            side,
+            price_raw,
+            amount_raw,
+            false,
+            block_num,
+            None,
+        );
+        Self::publish_delta(&inner, delta);
+    }
+
+    pub async fn apply_filled(
+        &self,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        fill_amount_raw: u64,
+        block_num: u64,
+        last_trade_price: u64,
+    ) {
+        if price_raw == 0 || fill_amount_raw == 0 {
+            return;
+        }
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let delta = Self::apply_level_change(
+            &mut inner,
+            &key,
+            side,
+            price_raw,
+            fill_amount_raw,
+            false,
+            block_num,
+            Some(last_trade_price),
+        );
+        Self::publish_delta(&inner, delta);
+    }
+
+    fn apply_level_change(
+        inner: &mut BookStoreInner,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        amount_raw: u64,
+        is_add: bool,
+        block_num: u64,
+        last_trade_price: Option<u64>,
+    ) -> Option<OrderBookDelta> {
+        let book = inner
+            .books
+            .entry(spot_market.to_string())
+            .or_insert_with(SpotBook::default);
+        let levels = match side {
+            OrderSide::Buy => &mut book.bids,
+            OrderSide::Sell => &mut book.asks,
+        };
+
+        let current = levels.get(&price_raw).copied().unwrap_or(0);
+        let next = if is_add {
+            current.saturating_add(amount_raw)
+        } else {
+            current.saturating_sub(amount_raw)
+        };
+
+        let level_delta = if next == 0 {
+            levels.remove(&price_raw);
+            BookLevelDelta {
+                price: format_price_pieces(price_raw),
+                size: "0".into(),
+            }
+        } else {
+            levels.insert(price_raw, next);
+            BookLevelDelta {
+                price: format_price_pieces(price_raw),
+                size: format_token_amount(next),
+            }
+        };
+
+        book.sequence = book.sequence.saturating_add(1);
+        if let Some(price) = last_trade_price {
+            book.last_trade_price = Some(price);
+        }
+
+        let (bids, asks) = match side {
+            OrderSide::Buy => (vec![level_delta], Vec::new()),
+            OrderSide::Sell => (Vec::new(), vec![level_delta]),
+        };
+
+        Some(OrderBookDelta {
+            msg_type: "orderbook_delta".into(),
+            spot_market: spot_market.to_string(),
+            sequence: book.sequence,
+            block_num,
+            bids,
+            asks,
+            last_trade_price: book
+                .last_trade_price
+                .map(|price| format_price_pieces(price)),
+        })
+    }
+
+    fn publish_delta(inner: &BookStoreInner, delta: Option<OrderBookDelta>) {
+        let Some(delta) = delta else {
+            return;
+        };
+        if let Some(sender) = inner.publishers.get(&delta.spot_market) {
+            let _ = sender.send(delta);
+        }
+    }
+
+    fn book_to_response(book: &SpotBook, depth: u32) -> BookResponse {
+        BookResponse {
+            sequence: book.sequence,
+            bids: book
+                .bids
+                .iter()
+                .rev()
+                .take(depth as usize)
+                .map(|(price, size)| BookLevel {
+                    price: format_price_pieces(*price),
+                    size: format_token_amount(*size),
+                })
+                .collect(),
+            asks: book
+                .asks
+                .iter()
+                .take(depth as usize)
+                .map(|(price, size)| BookLevel {
+                    price: format_price_pieces(*price),
+                    size: format_token_amount(*size),
+                })
+                .collect(),
+            last_trade_price: book
+                .last_trade_price
+                .map(|price| format_price_pieces(price)),
+        }
+    }
+
+    fn book_to_ws_snapshot(spot_market: &str, book: &SpotBook, depth: u32) -> OrderBookSnapshot {
+        let response = Self::book_to_response(book, depth);
+        OrderBookSnapshot {
+            msg_type: "orderbook_snapshot".into(),
+            spot_market: spot_market.to_string(),
+            sequence: response.sequence,
+            bids: response.bids,
+            asks: response.asks,
+            last_trade_price: response.last_trade_price,
+        }
+    }
+}

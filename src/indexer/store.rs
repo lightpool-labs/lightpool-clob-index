@@ -233,6 +233,26 @@ impl IndexStore {
         None
     }
 
+    pub async fn has_chain_order(&self, chain_order_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .chain_order_index
+            .contains_key(chain_order_id)
+    }
+
+    pub async fn spot_market_for_chain_order(&self, chain_order_id: &str) -> Option<String> {
+        let inner = self.inner.read().await;
+        let order_id = inner.chain_order_index.get(chain_order_id)?;
+        let stored = inner.orders.get(order_id)?;
+        let market = inner.markets.get(&stored.order.market_id)?;
+        if stored.order.outcome == "yes" {
+            Some(market.yes_spot_market.clone())
+        } else {
+            Some(market.no_spot_market.clone())
+        }
+    }
+
     pub async fn order_cancel_context(
         &self,
         order_id: Uuid,
@@ -243,7 +263,7 @@ impl IndexStore {
         if !stored.user_address.eq_ignore_ascii_case(user_address) {
             return None;
         }
-        if stored.order.status != "open" {
+        if stored.order.status != "open" && stored.order.status != "partial_filled" {
             return None;
         }
         let market = inner.markets.get(&stored.order.market_id)?;
@@ -307,7 +327,7 @@ impl IndexStore {
         stored.order.status = if is_fully_filled || remaining_amount == 0 {
             "filled".into()
         } else {
-            "open".into()
+            "partial_filled".into()
         };
     }
 }

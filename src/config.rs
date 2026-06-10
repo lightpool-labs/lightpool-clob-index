@@ -7,6 +7,7 @@ pub struct Config {
     pub lightpool_rpc_url: String,
     pub lightpool_ws_url: String,
     pub enable_indexer: bool,
+    pub query_account: String,
 }
 
 impl Config {
@@ -25,6 +26,8 @@ impl Config {
                 .ok()
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(true),
+            query_account: env::var("QUERY_ACCOUNT")
+                .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".into()),
         }
     }
 }

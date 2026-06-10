@@ -3,8 +3,10 @@ mod config;
 mod error;
 mod indexer;
 mod models;
+mod orderbook;
 mod routes;
 mod slug;
+mod spot_market;
 mod state;
 
 use std::net::SocketAddr;
@@ -35,7 +37,8 @@ async fn main() {
         let ws_url = config.lightpool_ws_url.clone();
         let head = state.indexed_head.clone();
         let index = state.index.clone();
-        let _indexer_handle = indexer::spawn(ws_url, head, index);
+        let book_store = state.book_store.clone();
+        let _indexer_handle = indexer::spawn(ws_url, head, index, book_store);
         tracing::info!("block indexer started");
     } else {
         tracing::info!("block indexer disabled");
