@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::models::{Market, MarketQuery, MarketSortOrder, Order};
+use crate::domain::{Market, MarketQuery, MarketSortOrder, Order};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexedBlockHead {
@@ -361,6 +361,26 @@ impl IndexStore {
         let mut inner = self.inner.write().await;
         inner.chain_order_index.insert(chain_order_id, order.id);
         inner.orders.insert(order.id, stored);
+    }
+
+    pub async fn stored_order_by_chain_id(
+        &self,
+        chain_order_id: &str,
+    ) -> Option<(Order, String, String)> {
+        let inner = self.inner.read().await;
+        let order_id = inner.chain_order_index.get(chain_order_id)?;
+        let stored = inner.orders.get(order_id)?;
+        let market = inner.markets.get(&stored.order.market_id)?;
+        let spot_market = if stored.order.outcome == "yes" {
+            market.yes_spot_market.clone()
+        } else {
+            market.no_spot_market.clone()
+        };
+        Some((
+            stored.order.clone(),
+            stored.user_address.clone(),
+            spot_market,
+        ))
     }
 
     pub async fn update_order_cancelled(&self, chain_order_id: &str) {

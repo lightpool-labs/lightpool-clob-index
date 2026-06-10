@@ -1,7 +1,7 @@
 use axum::{extract::State, routing::post, Json, Router};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{SubmitTxRequest, SubmitTxResponse};
+use crate::http::models::{SubmitTxRequest, SubmitTxResponse};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {

@@ -8,13 +8,14 @@ use lightpool_sdk::{Message, Subscription, WebSocketClient};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub use book_store::{BookStore, OrderBookDelta, OrderBookSnapshot, SharedBookStore};
-pub use processor::{apply_order_created_to_book, index_order_created};
-pub use store::{
-    market_uuid, IndexStore, IndexedBlockHead, SharedIndexStore, SharedIndexedBlockHead, new_head,
-};
+pub use book_store::BookStore;
+pub use processor::{apply_order_created_to_book, index_order_created, publish_user_order_created};
+pub use store::{IndexStore, SharedIndexStore, SharedIndexedBlockHead, new_head};
+
+pub use book_store::SharedBookStore;
 
 use crate::error::{AppError, AppResult};
+use crate::ws::process::SharedUserEventHub;
 
 use processor::process_block;
 
@@ -23,10 +24,19 @@ pub fn spawn(
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
     book_store: SharedBookStore,
+    user_hub: SharedUserEventHub,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match run_once(&ws_url, head.clone(), index.clone(), book_store.clone()).await {
+            match run_once(
+                &ws_url,
+                head.clone(),
+                index.clone(),
+                book_store.clone(),
+                user_hub.clone(),
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::warn!("indexer stream ended, reconnecting in 5s");
                 }
@@ -50,6 +60,7 @@ async fn run_once(
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
     book_store: SharedBookStore,
+    user_hub: SharedUserEventHub,
 ) -> AppResult<()> {
     let mut client = WebSocketClient::new(Some(ws_url.to_string()))
         .await
@@ -77,7 +88,7 @@ async fn run_once(
 
                 tracing::info!(block_num, tx_count, "processing block");
 
-                process_block(&index, &book_store, block).await;
+                process_block(&index, &book_store, &user_hub, block).await;
 
                 let mut state = head.write().await;
                 state.block_num = block_num;

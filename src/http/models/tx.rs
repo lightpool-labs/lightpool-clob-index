@@ -1,0 +1,14 @@
+use serde::Deserialize;
+
+use lightpool_sdk::lightpool_types::TransactionReceipt;
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitTxRequest {
+    pub tx: lightpool_sdk::lightpool_types::SignedTransaction,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SubmitTxResponse {
+    pub digest: String,
+    pub receipt: TransactionReceipt,
+}

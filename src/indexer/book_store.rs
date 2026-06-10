@@ -3,43 +3,14 @@ use std::sync::Arc;
 
 use lightpool_sdk::lightpool_types::call::GetOrderBook;
 use lightpool_sdk::OrderSide;
-use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::chain::{format_price_pieces, format_token_amount};
-use crate::models::{BookLevel, BookResponse};
+use crate::domain::{BookLevel, BookSnapshot};
 use crate::spot_market::normalize_spot_market_key;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BookLevelDelta {
-    pub price: String,
-    pub size: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OrderBookSnapshot {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub spot_market: String,
-    pub sequence: u64,
-    pub bids: Vec<BookLevel>,
-    pub asks: Vec<BookLevel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_trade_price: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OrderBookDelta {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub spot_market: String,
-    pub sequence: u64,
-    pub block_num: u64,
-    pub bids: Vec<BookLevelDelta>,
-    pub asks: Vec<BookLevelDelta>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_trade_price: Option<String>,
-}
+use crate::ws::models::{
+    BookLevelDelta, OrderBookDelta, OrderBookSnapshot, QuoteDelta, QuoteSnapshot,
+};
 
 #[derive(Debug, Default)]
 struct SpotBook {
@@ -53,6 +24,7 @@ struct SpotBook {
 struct BookStoreInner {
     books: HashMap<String, SpotBook>,
     publishers: HashMap<String, broadcast::Sender<OrderBookDelta>>,
+    quote_publishers: HashMap<String, broadcast::Sender<QuoteDelta>>,
 }
 
 pub struct BookStore {
@@ -77,12 +49,22 @@ impl BookStore {
         let mut inner = self.inner.write().await;
         let sender = inner
             .publishers
+            .entry(key.clone())
+            .or_insert_with(|| broadcast::channel(256).0);
+        sender.subscribe()
+    }
+
+    pub async fn subscribe_quote(&self, spot_market: &str) -> broadcast::Receiver<QuoteDelta> {
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let sender = inner
+            .quote_publishers
             .entry(key)
             .or_insert_with(|| broadcast::channel(256).0);
         sender.subscribe()
     }
 
-    pub async fn snapshot(&self, spot_market: &str, depth: u32) -> Option<BookResponse> {
+    pub async fn snapshot(&self, spot_market: &str, depth: u32) -> Option<BookSnapshot> {
         let key = Self::key(spot_market);
         let inner = self.inner.read().await;
         let book = inner.books.get(&key)?;
@@ -94,6 +76,13 @@ impl BookStore {
         let inner = self.inner.read().await;
         let book = inner.books.get(&key)?;
         Some(Self::book_to_ws_snapshot(&key, book, depth))
+    }
+
+    pub async fn ws_quote_snapshot(&self, spot_market: &str) -> Option<QuoteSnapshot> {
+        let key = Self::key(spot_market);
+        let inner = self.inner.read().await;
+        let book = inner.books.get(&key)?;
+        Some(Self::book_to_quote_snapshot(&key, book))
     }
 
     pub async fn is_hydrated(&self, spot_market: &str) -> bool {
@@ -279,12 +268,56 @@ impl BookStore {
             return;
         };
         if let Some(sender) = inner.publishers.get(&delta.spot_market) {
-            let _ = sender.send(delta);
+            let _ = sender.send(delta.clone());
+        }
+        if let Some(book) = inner.books.get(&delta.spot_market) {
+            Self::publish_quote(inner, &delta.spot_market, delta.block_num, book);
         }
     }
 
-    fn book_to_response(book: &SpotBook, depth: u32) -> BookResponse {
-        BookResponse {
+    fn publish_quote(inner: &BookStoreInner, spot_market: &str, block_num: u64, book: &SpotBook) {
+        let quote = Self::quote_from_book(spot_market, block_num, book);
+        if let Some(sender) = inner.quote_publishers.get(spot_market) {
+            let _ = sender.send(quote);
+        }
+    }
+
+    fn quote_from_book(spot_market: &str, block_num: u64, book: &SpotBook) -> QuoteDelta {
+        let best_bid = book.bids.iter().next_back().map(|(price, size)| BookLevel {
+            price: format_price_pieces(*price),
+            size: format_token_amount(*size),
+        });
+        let best_ask = book.asks.iter().next().map(|(price, size)| BookLevel {
+            price: format_price_pieces(*price),
+            size: format_token_amount(*size),
+        });
+        QuoteDelta {
+            msg_type: "quote".into(),
+            spot_market: spot_market.to_string(),
+            sequence: book.sequence,
+            block_num,
+            best_bid,
+            best_ask,
+            last_trade_price: book
+                .last_trade_price
+                .map(|price| format_price_pieces(price)),
+        }
+    }
+
+    fn book_to_quote_snapshot(spot_market: &str, book: &SpotBook) -> QuoteSnapshot {
+        let quote = Self::quote_from_book(spot_market, 0, book);
+        QuoteSnapshot {
+            msg_type: "quote_snapshot".into(),
+            spot_market: quote.spot_market,
+            sequence: quote.sequence,
+            best_bid: quote.best_bid,
+            best_ask: quote.best_ask,
+            last_trade_price: quote.last_trade_price,
+        }
+    }
+
+    fn book_to_response(book: &SpotBook, depth: u32) -> BookSnapshot {
+        BookSnapshot {
             sequence: book.sequence,
             bids: book
                 .bids

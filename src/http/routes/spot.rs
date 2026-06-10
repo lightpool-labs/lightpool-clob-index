@@ -8,8 +8,8 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{BookResponse, MarketInfoResponse};
-use crate::orderbook::ensure_hydrated;
+use crate::http::models::{BookResponse, MarketInfoResponse};
+use crate::http::process::ensure_hydrated;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {

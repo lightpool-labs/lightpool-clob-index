@@ -1,13 +1,13 @@
 mod chain;
 mod config;
+mod domain;
 mod error;
+mod http;
 mod indexer;
-mod models;
-mod orderbook;
-mod routes;
 mod slug;
 mod spot_market;
 mod state;
+mod ws;
 
 use std::net::SocketAddr;
 
@@ -38,14 +38,15 @@ async fn main() {
         let head = state.indexed_head.clone();
         let index = state.index.clone();
         let book_store = state.book_store.clone();
-        let _indexer_handle = indexer::spawn(ws_url, head, index, book_store);
+        let user_hub = state.user_hub.clone();
+        let _indexer_handle = indexer::spawn(ws_url, head, index, book_store, user_hub);
         tracing::info!("block indexer started");
     } else {
         tracing::info!("block indexer disabled");
     }
 
     let app = Router::new()
-        .nest("/api", routes::api_router())
+        .nest("/api", http::router())
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::indexer::{
     BookStore, IndexStore, SharedBookStore, SharedIndexStore, SharedIndexedBlockHead, new_head,
 };
+use crate::ws::process::{SharedUserEventHub, UserEventHub};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -13,6 +14,7 @@ pub struct AppState {
     pub indexed_head: SharedIndexedBlockHead,
     pub index: SharedIndexStore,
     pub book_store: SharedBookStore,
+    pub user_hub: SharedUserEventHub,
 }
 
 impl AppState {
@@ -24,6 +26,7 @@ impl AppState {
             indexed_head: new_head(),
             index: Arc::new(IndexStore::new()),
             book_store: Arc::new(BookStore::new()),
+            user_hub: Arc::new(UserEventHub::new()),
         }
     }
 }

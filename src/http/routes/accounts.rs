@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 use crate::chain::format_token_amount;
 use crate::error::{AppError, AppResult};
-use crate::models::{BalanceEntry, BalancesRequest};
+use crate::http::models::{BalanceEntry, BalancesRequest};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {

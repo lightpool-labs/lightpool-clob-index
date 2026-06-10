@@ -7,9 +7,10 @@ use lightpool_sdk::spot_events::OrderCreatedEvent;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::domain::Order;
 use crate::error::{AppError, AppResult};
-use crate::indexer::{apply_order_created_to_book, index_order_created};
-use crate::models::{CancelContextResponse, Order};
+use crate::http::models::CancelContextResponse;
+use crate::indexer::{apply_order_created_to_book, index_order_created, publish_user_order_created};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -93,12 +94,16 @@ async fn index_from_event(
     Json(event): Json<OrderCreatedEvent>,
 ) -> AppResult<Json<Order>> {
     let chain_order_id = event.order_id.to_string();
-    if !state.index.has_chain_order(&chain_order_id).await {
+    let is_new = !state.index.has_chain_order(&chain_order_id).await;
+    if is_new {
         apply_order_created_to_book(&state.book_store, 0, &event).await;
     }
 
     let order = index_order_created(&state.index, event)
         .await
         .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;
+    if is_new {
+        publish_user_order_created(&state.user_hub, &state.index, &chain_order_id, 0).await;
+    }
     Ok(Json(order))
 }

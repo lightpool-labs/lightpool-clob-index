@@ -14,7 +14,8 @@ use lightpool_sdk::lightpool_types::TransactionResult;
 use uuid::Uuid;
 
 use crate::chain::{format_price_pieces, format_token_amount};
-use crate::models::{Market, Order};
+use crate::domain::{Market, Order};
+use crate::ws::process::SharedUserEventHub;
 
 use super::book_store::SharedBookStore;
 use super::store::{market_uuid, question_from_hash, IndexStore, SharedIndexStore};
@@ -22,6 +23,7 @@ use super::store::{market_uuid, question_from_hash, IndexStore, SharedIndexStore
 pub async fn process_block(
     store: &SharedIndexStore,
     book_store: &SharedBookStore,
+    user_hub: &SharedUserEventHub,
     block: VerifiedBlock,
 ) {
     let block_num = block.block_num;
@@ -76,8 +78,15 @@ pub async fn process_block(
                             let chain_order_id = created.order_id.to_string();
                             if !store.has_chain_order(&chain_order_id).await {
                                 apply_order_created_to_book(book_store, block_num, &created).await;
+                                index_order_created(store, created).await;
+                                publish_user_order_created(
+                                    user_hub,
+                                    store,
+                                    &chain_order_id,
+                                    block_num,
+                                )
+                                .await;
                             }
-                            index_order_created(store, created).await;
                         }
                     }
                 }
@@ -99,12 +108,15 @@ pub async fn process_block(
                                     .await;
                             }
                             store.update_order_cancelled(&chain_order_id).await;
+                            publish_user_order_cancelled(user_hub, store, &chain_order_id, block_num)
+                                .await;
                         }
                     }
                 }
                 "order_filled" => {
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(filled) = bincode::deserialize::<OrderFilledEvent>(data) {
+                            let chain_order_id = filled.order_id.to_string();
                             let spot_market =
                                 crate::spot_market::normalize_spot_market_key(&filled.market.to_string());
                             store
@@ -122,12 +134,25 @@ pub async fn process_block(
                                 .await;
                             store
                                 .update_order_fill(
-                                    &filled.order_id.to_string(),
+                                    &chain_order_id,
                                     filled.fill_amount,
                                     filled.remaining_amount,
                                     filled.is_fully_filled,
                                 )
                                 .await;
+                            publish_user_order_filled(
+                                user_hub,
+                                store,
+                                &chain_order_id,
+                                &spot_market,
+                                filled.price,
+                                filled.fill_amount,
+                                filled.remaining_amount,
+                                filled.is_fully_filled,
+                                filled.side,
+                                block_num,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -454,4 +479,88 @@ pub async fn index_order_created(store: &SharedIndexStore, created: OrderCreated
         .await;
 
     Some(order)
+}
+
+pub async fn publish_user_order_created(
+    user_hub: &SharedUserEventHub,
+    store: &SharedIndexStore,
+    chain_order_id: &str,
+    block_num: u64,
+) {
+    let Some((order, user_address, _)) = store.stored_order_by_chain_id(chain_order_id).await else {
+        return;
+    };
+    user_hub
+        .publish_order(
+            "placement",
+            &user_address,
+            chain_order_id,
+            order,
+            block_num,
+        )
+        .await;
+}
+
+async fn publish_user_order_cancelled(
+    user_hub: &SharedUserEventHub,
+    store: &SharedIndexStore,
+    chain_order_id: &str,
+    block_num: u64,
+) {
+    let Some((order, user_address, _)) = store.stored_order_by_chain_id(chain_order_id).await else {
+        return;
+    };
+    user_hub
+        .publish_order(
+            "cancellation",
+            &user_address,
+            chain_order_id,
+            order,
+            block_num,
+        )
+        .await;
+}
+
+async fn publish_user_order_filled(
+    user_hub: &SharedUserEventHub,
+    store: &SharedIndexStore,
+    chain_order_id: &str,
+    spot_market: &str,
+    price_raw: u64,
+    fill_amount_raw: u64,
+    remaining_amount_raw: u64,
+    is_fully_filled: bool,
+    side: lightpool_sdk::OrderSide,
+    block_num: u64,
+) {
+    let Some((order, user_address, _)) = store.stored_order_by_chain_id(chain_order_id).await else {
+        return;
+    };
+
+    let side_str = match side {
+        lightpool_sdk::OrderSide::Buy => "buy",
+        lightpool_sdk::OrderSide::Sell => "sell",
+    };
+
+    user_hub
+        .publish_trade(
+            &user_address,
+            chain_order_id,
+            order.id,
+            &order.event_slug,
+            &order.outcome,
+            side_str,
+            &format_price_pieces(price_raw),
+            &format_token_amount(fill_amount_raw),
+            &format_token_amount(remaining_amount_raw),
+            is_fully_filled,
+            spot_market,
+            block_num,
+        )
+        .await;
+
+    let event = "update";
+    user_hub
+        .publish_order(event, &user_address, chain_order_id, order, block_num)
+        .await;
 }

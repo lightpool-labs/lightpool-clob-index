@@ -1,0 +1,16 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    pub id: Uuid,
+    pub market_id: Uuid,
+    #[serde(default)]
+    pub event_slug: String,
+    pub question: String,
+    pub outcome: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub status: String,
+}
