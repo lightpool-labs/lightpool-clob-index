@@ -93,7 +93,7 @@ async fn handle_client_message(
 
     match request.op.as_str() {
         "subscribe" => {
-            if request.channel.as_deref() != Some("orderbook") {
+            if request.channel.as_deref() != Some("orderbook_delta") {
                 return true;
             }
             let Some(spot_market) = request.spot_market.filter(|value| !value.trim().is_empty())

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::models::{Market, Order};
+use crate::models::{Market, MarketQuery, MarketSortOrder, Order};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexedBlockHead {
@@ -62,11 +62,76 @@ impl IndexStore {
         }
     }
 
-    pub async fn list_markets(&self) -> Vec<Market> {
+    pub async fn market_count(&self) -> usize {
+        self.inner.read().await.markets.len()
+    }
+
+    pub async fn query_markets(&self, query: MarketQuery) -> (Vec<Market>, usize) {
         let inner = self.inner.read().await;
         let mut markets: Vec<Market> = inner.markets.values().cloned().collect();
-        markets.sort_by_key(|m| m.resolution_deadline);
-        markets
+
+        if let Some(slug) = query.slug.as_deref() {
+            markets.retain(|market| market.slug == slug);
+        }
+
+        if !query.slugs.is_empty() {
+            let allowed: HashSet<&str> = query.slugs.iter().map(String::as_str).collect();
+            markets.retain(|market| allowed.contains(market.slug.as_str()));
+        }
+
+        if !query.market_ids.is_empty() {
+            let allowed: HashSet<Uuid> = query.market_ids.iter().copied().collect();
+            markets.retain(|market| allowed.contains(&market.id));
+        }
+
+        if !query.market_addresses.is_empty() {
+            let allowed: HashSet<String> = query
+                .market_addresses
+                .iter()
+                .map(|address| address.trim().to_ascii_lowercase())
+                .collect();
+            markets.retain(|market| {
+                allowed.contains(&market.market_address.trim().to_ascii_lowercase())
+            });
+        }
+
+        if let Some(state) = query.state.as_deref() {
+            markets.retain(|market| market.state.eq_ignore_ascii_case(state));
+        }
+
+        match query.order {
+            MarketSortOrder::ResolutionDeadline => {
+                if query.ascending {
+                    markets.sort_by_key(|market| market.resolution_deadline);
+                } else {
+                    markets.sort_by_key(|market| std::cmp::Reverse(market.resolution_deadline));
+                }
+            }
+            MarketSortOrder::Slug => {
+                if query.ascending {
+                    markets.sort_by(|left, right| left.slug.cmp(&right.slug));
+                } else {
+                    markets.sort_by(|left, right| right.slug.cmp(&left.slug));
+                }
+            }
+            MarketSortOrder::Question => {
+                if query.ascending {
+                    markets.sort_by(|left, right| left.question.cmp(&right.question));
+                } else {
+                    markets.sort_by(|left, right| right.question.cmp(&left.question));
+                }
+            }
+        }
+
+        let total = markets.len();
+        let offset = query.offset as usize;
+        let page = markets
+            .into_iter()
+            .skip(offset)
+            .take(query.limit as usize)
+            .collect();
+
+        (page, total)
     }
 
     pub async fn get_market(&self, id: Uuid) -> Option<Market> {

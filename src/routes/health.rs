@@ -17,7 +17,7 @@ async fn health() -> Json<serde_json::Value> {
 async fn ready(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let node_ok = state.chain.health_check().await?;
     let head = state.indexed_head.read().await.clone();
-    let market_count = state.index.list_markets().await.len();
+    let market_count = state.index.market_count().await;
 
     Ok(Json(json!({
         "status": if node_ok { "ready" } else { "degraded" },
