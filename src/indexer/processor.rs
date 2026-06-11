@@ -442,7 +442,7 @@ pub async fn index_order_created(store: &SharedIndexStore, created: OrderCreated
         .await
         .map(|market| market.question)
         .unwrap_or_default();
-    let event_slug = store
+    let market_slug = store
         .get_market(market_id)
         .await
         .map(|market| market.slug)
@@ -453,7 +453,7 @@ pub async fn index_order_created(store: &SharedIndexStore, created: OrderCreated
             format!("{market_id}:{chain_order_id}").as_bytes(),
         ),
         market_id,
-        event_slug,
+        market_slug,
         question,
         outcome,
         side: side.into(),
@@ -547,7 +547,7 @@ async fn publish_user_order_filled(
             &user_address,
             chain_order_id,
             order.id,
-            &order.event_slug,
+            &order.market_slug,
             &order.outcome,
             side_str,
             &format_price_pieces(price_raw),

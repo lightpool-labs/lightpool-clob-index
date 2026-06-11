@@ -22,7 +22,7 @@ pub struct UserTradeMessage {
     pub user_address: String,
     pub chain_order_id: String,
     pub order_id: Uuid,
-    pub event_slug: String,
+    pub market_slug: String,
     pub outcome: String,
     pub side: String,
     pub price: String,

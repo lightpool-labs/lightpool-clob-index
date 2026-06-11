@@ -6,7 +6,7 @@ pub struct Order {
     pub id: Uuid,
     pub market_id: Uuid,
     #[serde(default)]
-    pub event_slug: String,
+    pub market_slug: String,
     pub question: String,
     pub outcome: String,
     pub side: String,

@@ -41,13 +41,13 @@ async fn list_orders(
         .await;
 
     for order in &mut orders {
-        if order.question.is_empty() || order.event_slug.is_empty() {
+        if order.question.is_empty() || order.market_slug.is_empty() {
             if let Some(market) = state.index.get_market(order.market_id).await {
                 if order.question.is_empty() {
                     order.question = market.question;
                 }
-                if order.event_slug.is_empty() {
-                    order.event_slug = market.slug;
+                if order.market_slug.is_empty() {
+                    order.market_slug = market.slug;
                 }
             }
         }
