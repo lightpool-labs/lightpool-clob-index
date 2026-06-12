@@ -173,6 +173,46 @@ impl BookStore {
         Self::publish_delta(&inner, delta);
     }
 
+    pub async fn apply_updated(
+        &self,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        old_amount_raw: u64,
+        new_amount_raw: u64,
+        block_num: u64,
+    ) {
+        if price_raw == 0 || old_amount_raw == new_amount_raw {
+            return;
+        }
+        let key = Self::key(spot_market);
+        let mut inner = self.inner.write().await;
+        let delta = if new_amount_raw > old_amount_raw {
+            Self::apply_level_change(
+                &mut inner,
+                &key,
+                side,
+                price_raw,
+                new_amount_raw - old_amount_raw,
+                true,
+                block_num,
+                None,
+            )
+        } else {
+            Self::apply_level_change(
+                &mut inner,
+                &key,
+                side,
+                price_raw,
+                old_amount_raw - new_amount_raw,
+                false,
+                block_num,
+                None,
+            )
+        };
+        Self::publish_delta(&inner, delta);
+    }
+
     pub async fn apply_filled(
         &self,
         spot_market: &str,

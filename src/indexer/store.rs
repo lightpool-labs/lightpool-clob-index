@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::domain::{Market, MarketQuery, MarketSortOrder, Order};
+use crate::spot_market::normalize_spot_market_key;
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexedBlockHead {
@@ -46,6 +47,7 @@ struct IndexStoreInner {
     last_trade_price_by_spot: HashMap<String, u64>,
     orders: HashMap<Uuid, StoredOrder>,
     chain_order_index: HashMap<String, Uuid>,
+    chain_order_spot: HashMap<String, String>,
     question_by_hash: HashMap<String, QuestionEntry>,
 }
 
@@ -240,18 +242,34 @@ impl IndexStore {
                 .insert(market.slug.clone(), market.id);
         }
 
-        inner
-            .spot_to_market
-            .insert(market.yes_spot_market.clone(), SpotMarketRef {
+        let yes_spot = normalize_spot_market_key(&market.yes_spot_market);
+        let no_spot = normalize_spot_market_key(&market.no_spot_market);
+        market.yes_spot_market = yes_spot.clone();
+        market.no_spot_market = no_spot.clone();
+
+        if yes_spot == no_spot {
+            tracing::warn!(
+                market_id = %market.id,
+                slug = %market.slug,
+                spot_market = %yes_spot,
+                "yes and no spot markets share the same address"
+            );
+        }
+
+        inner.spot_to_market.insert(
+            yes_spot,
+            SpotMarketRef {
                 market_id: market.id,
                 outcome: "yes".into(),
-            });
-        inner
-            .spot_to_market
-            .insert(market.no_spot_market.clone(), SpotMarketRef {
+            },
+        );
+        inner.spot_to_market.insert(
+            no_spot,
+            SpotMarketRef {
                 market_id: market.id,
                 outcome: "no".into(),
-            });
+            },
+        );
         inner.markets.insert(market.id, market);
     }
 
@@ -265,37 +283,31 @@ impl IndexStore {
     }
 
     pub async fn lookup_spot_market(&self, spot_market: &str) -> Option<(Uuid, String)> {
+        let key = normalize_spot_market_key(spot_market);
         let inner = self.inner.read().await;
-        if let Some(spot) = inner.spot_to_market.get(spot_market) {
-            return Some((spot.market_id, spot.outcome.clone()));
-        }
-        if let Some(key) = contract_key_from_market_ref(spot_market) {
-            if let Some(spot) = inner.spot_to_market.get(&key) {
-                return Some((spot.market_id, spot.outcome.clone()));
-            }
-        }
-        None
+        inner
+            .spot_to_market
+            .get(&key)
+            .map(|spot| (spot.market_id, spot.outcome.clone()))
     }
 
     pub async fn record_last_trade_price(&self, spot_market: &str, price: u64) {
-        let mut inner = self.inner.write().await;
-        inner
+        let key = normalize_spot_market_key(spot_market);
+        self.inner
+            .write()
+            .await
             .last_trade_price_by_spot
-            .insert(spot_market.to_string(), price);
-        if let Some(key) = contract_key_from_market_ref(spot_market) {
-            inner.last_trade_price_by_spot.insert(key, price);
-        }
+            .insert(key, price);
     }
 
     pub async fn last_trade_price(&self, spot_market: &str) -> Option<u64> {
-        let inner = self.inner.read().await;
-        if let Some(price) = inner.last_trade_price_by_spot.get(spot_market) {
-            return Some(*price);
-        }
-        if let Some(key) = contract_key_from_market_ref(spot_market) {
-            return inner.last_trade_price_by_spot.get(&key).copied();
-        }
-        None
+        let key = normalize_spot_market_key(spot_market);
+        self.inner
+            .read()
+            .await
+            .last_trade_price_by_spot
+            .get(&key)
+            .copied()
     }
 
     pub async fn has_chain_order(&self, chain_order_id: &str) -> bool {
@@ -306,8 +318,20 @@ impl IndexStore {
             .contains_key(chain_order_id)
     }
 
+    pub async fn register_chain_order_spot(&self, chain_order_id: &str, spot_market: &str) {
+        let key = normalize_spot_market_key(spot_market);
+        self.inner
+            .write()
+            .await
+            .chain_order_spot
+            .insert(chain_order_id.to_string(), key);
+    }
+
     pub async fn spot_market_for_chain_order(&self, chain_order_id: &str) -> Option<String> {
         let inner = self.inner.read().await;
+        if let Some(spot) = inner.chain_order_spot.get(chain_order_id) {
+            return Some(spot.clone());
+        }
         let order_id = inner.chain_order_index.get(chain_order_id)?;
         let stored = inner.orders.get(order_id)?;
         let market = inner.markets.get(&stored.order.market_id)?;
@@ -393,6 +417,31 @@ impl IndexStore {
         }
     }
 
+    pub async fn update_order_amount(
+        &self,
+        chain_order_id: &str,
+        new_amount: u64,
+        remaining_amount: u64,
+    ) {
+        let mut inner = self.inner.write().await;
+        let Some(order_id) = inner.chain_order_index.get(chain_order_id).copied() else {
+            return;
+        };
+        let Some(stored) = inner.orders.get_mut(&order_id) else {
+            return;
+        };
+
+        stored.size_raw = new_amount;
+        stored.order.size = crate::chain::format_token_amount(new_amount);
+        stored.order.status = if remaining_amount == 0 {
+            "filled".into()
+        } else if stored.filled_raw > 0 {
+            "partial_filled".into()
+        } else {
+            "open".into()
+        };
+    }
+
     pub async fn update_order_fill(
         &self,
         chain_order_id: &str,
@@ -430,13 +479,3 @@ pub fn question_from_hash(hash: &[u8; 32]) -> String {
     String::from_utf8_lossy(&hash[..end]).trim().to_string()
 }
 
-fn contract_key_from_market_ref(value: &str) -> Option<String> {
-    let hex_body = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .unwrap_or(value);
-    if hex_body.len() < 16 {
-        return None;
-    }
-    Some(format!("0x{}", &hex_body[..16]))
-}

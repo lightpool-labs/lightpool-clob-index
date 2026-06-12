@@ -3,7 +3,7 @@ use lightpool_sdk::event_contract_events::{
     EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
-    OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent,
+    OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent, OrderUpdatedEvent,
     parse_spot_event_data,
 };
 use lightpool_sdk::token_events::{
@@ -18,7 +18,16 @@ use crate::domain::{Market, Order};
 use crate::ws::process::SharedUserEventHub;
 
 use super::book_store::SharedBookStore;
-use super::store::{market_uuid, question_from_hash, IndexStore, SharedIndexStore};
+use super::store::{market_uuid, question_from_hash, SharedIndexStore};
+
+#[derive(Default)]
+struct BlockOrderSyncStats {
+    created_total: u32,
+    created_yes: u32,
+    created_no: u32,
+    created_unknown: u32,
+    skipped_duplicates: u32,
+}
 
 pub async fn process_block(
     store: &SharedIndexStore,
@@ -27,6 +36,7 @@ pub async fn process_block(
     block: VerifiedBlock,
 ) {
     let block_num = block.block_num;
+    let mut sync_stats = BlockOrderSyncStats::default();
 
     for tx_result in block.transaction_outputs {
         log_tx_result(&tx_result);
@@ -76,9 +86,38 @@ pub async fn process_block(
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(created) = bincode::deserialize::<OrderCreatedEvent>(data) {
                             let chain_order_id = created.order_id.to_string();
-                            if !store.has_chain_order(&chain_order_id).await {
-                                apply_order_created_to_book(book_store, block_num, &created).await;
-                                index_order_created(store, created).await;
+                            let spot_market = crate::spot_market::normalize_spot_market_key(
+                                &created.market.to_string(),
+                            );
+                            store
+                                .register_chain_order_spot(&chain_order_id, &spot_market)
+                                .await;
+                            if store.has_chain_order(&chain_order_id).await {
+                                sync_stats.skipped_duplicates += 1;
+                                tracing::warn!(
+                                    block_num,
+                                    order_id = chain_order_id,
+                                    spot_market,
+                                    "block_sync order_created skipped duplicate"
+                                );
+                            } else {
+                                log_block_sync_order_created(
+                                    &mut sync_stats,
+                                    store,
+                                    block_num,
+                                    &created,
+                                    &spot_market,
+                                )
+                                .await;
+                                apply_order_created_to_book(
+                                    book_store,
+                                    store,
+                                    block_num,
+                                    &created,
+                                    &spot_market,
+                                )
+                                .await;
+                                index_order_created(store, created, &spot_market).await;
                                 publish_user_order_created(
                                     user_hub,
                                     store,
@@ -106,9 +145,49 @@ pub async fn process_block(
                                         block_num,
                                     )
                                     .await;
+                            } else {
+                                tracing::warn!(
+                                    order_id = chain_order_id,
+                                    "order_cancelled without indexed spot market"
+                                );
                             }
                             store.update_order_cancelled(&chain_order_id).await;
                             publish_user_order_cancelled(user_hub, store, &chain_order_id, block_num)
+                                .await;
+                        }
+                    }
+                }
+                "order_updated" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(updated) = bincode::deserialize::<OrderUpdatedEvent>(data) {
+                            let chain_order_id = updated.order_id.to_string();
+                            if let Some(spot_market) =
+                                store.spot_market_for_chain_order(&chain_order_id).await
+                            {
+                                book_store
+                                    .apply_updated(
+                                        &spot_market,
+                                        updated.side,
+                                        updated.price,
+                                        updated.old_amount,
+                                        updated.new_amount,
+                                        block_num,
+                                    )
+                                    .await;
+                            } else {
+                                tracing::warn!(
+                                    order_id = chain_order_id,
+                                    "order_updated without indexed spot market"
+                                );
+                            }
+                            store
+                                .update_order_amount(
+                                    &chain_order_id,
+                                    updated.new_amount,
+                                    updated.remaining_amount,
+                                )
+                                .await;
+                            publish_user_order_updated(user_hub, store, &chain_order_id, block_num)
                                 .await;
                         }
                     }
@@ -159,6 +238,18 @@ pub async fn process_block(
                 _ => {}
             }
         }
+    }
+
+    if sync_stats.created_total > 0 || sync_stats.skipped_duplicates > 0 {
+        tracing::warn!(
+            block_num,
+            created_total = sync_stats.created_total,
+            created_yes = sync_stats.created_yes,
+            created_no = sync_stats.created_no,
+            created_unknown = sync_stats.created_unknown,
+            skipped_duplicates = sync_stats.skipped_duplicates,
+            "block_sync order_created summary"
+        );
     }
 }
 
@@ -327,6 +418,19 @@ fn format_event_detail(event: &TransactionEvent) -> String {
                 );
             }
         }
+        "order_updated" => {
+            if let Ok(e) = bincode::deserialize::<OrderUpdatedEvent>(bytes) {
+                return format!(
+                    "order_updated: id={} side={:?} price={} old={} new={} remaining={}",
+                    e.order_id,
+                    e.side,
+                    format_price_pieces(e.price),
+                    format_token_amount(e.old_amount),
+                    format_token_amount(e.new_amount),
+                    format_token_amount(e.remaining_amount),
+                );
+            }
+        }
         "order_filled" => {
             if let Ok(e) = bincode::deserialize::<OrderFilledEvent>(bytes) {
                 return format!(
@@ -357,27 +461,98 @@ fn format_event_detail(event: &TransactionEvent) -> String {
     format!("{action}: (undecoded)")
 }
 
-pub async fn apply_order_created_to_book(
-    book_store: &SharedBookStore,
+async fn log_block_sync_order_created(
+    stats: &mut BlockOrderSyncStats,
+    store: &SharedIndexStore,
     block_num: u64,
     created: &OrderCreatedEvent,
+    spot_market: &str,
 ) {
     let OrderEventType::Limit { price, .. } = &created.order_type else {
         return;
     };
 
-    let spot_market =
-        crate::spot_market::normalize_spot_market_key(&created.market.to_string());
+    let (outcome, slug) = match store.lookup_spot_market(spot_market).await {
+        Some((market_id, outcome)) => {
+            let slug = store
+                .get_market(market_id)
+                .await
+                .map(|market| market.slug);
+            (outcome, slug)
+        }
+        None => ("unknown".into(), None),
+    };
+
+    match outcome.as_str() {
+        "yes" => stats.created_yes += 1,
+        "no" => stats.created_no += 1,
+        _ => stats.created_unknown += 1,
+    }
+    stats.created_total += 1;
+
+    let side = match created.side {
+        lightpool_sdk::OrderSide::Buy => "buy",
+        lightpool_sdk::OrderSide::Sell => "sell",
+    };
+
+    tracing::warn!(
+        block_num,
+        order_id = %created.order_id,
+        slug = slug.as_deref().unwrap_or("-"),
+        outcome,
+        spot_market,
+        side,
+        price = %format_price_pieces(*price),
+        quantity = %format_token_amount(created.amount),
+        creator = %created.creator,
+        "block_sync order_created"
+    );
+
+    warn_outcome_price_mismatch(&outcome, *price, spot_market, &created.order_id.to_string());
+}
+
+pub async fn apply_order_created_to_book(
+    book_store: &SharedBookStore,
+    _store: &SharedIndexStore,
+    block_num: u64,
+    created: &OrderCreatedEvent,
+    spot_market: &str,
+) {
+    let OrderEventType::Limit { price, .. } = &created.order_type else {
+        return;
+    };
 
     book_store
         .apply_created(
-            &spot_market,
+            spot_market,
             created.side,
             *price,
             created.amount,
             block_num,
         )
         .await;
+}
+
+fn warn_outcome_price_mismatch(outcome: &str, price_raw: u64, spot_market: &str, order_id: &str) {
+    use lightpool_sdk::TOKEN_SCALE;
+    let threshold = TOKEN_SCALE * 55 / 100;
+    let price_display = format_price_pieces(price_raw);
+
+    let mismatch = match outcome {
+        "yes" if price_raw > threshold => true,
+        "no" if price_raw < threshold => true,
+        _ => false,
+    };
+
+    if mismatch {
+        tracing::warn!(
+            order_id,
+            spot_market,
+            outcome,
+            price = %price_display,
+            "order price looks inconsistent with spot outcome (possible wrong spot or mapping bug)"
+        );
+    }
 }
 
 async fn index_market_created(store: &SharedIndexStore, created: EventContractCreatedEvent) {
@@ -418,10 +593,17 @@ async fn index_market_created(store: &SharedIndexStore, created: EventContractCr
     store.upsert_market(market).await;
 }
 
-pub async fn index_order_created(store: &SharedIndexStore, created: OrderCreatedEvent) -> Option<Order> {
-    let spot_market = created.market.to_string();
-    let Some((market_id, outcome)) = store.lookup_spot_market(&spot_market).await else {
-        tracing::debug!(spot_market, "order_created for unknown spot market");
+pub async fn index_order_created(
+    store: &SharedIndexStore,
+    created: OrderCreatedEvent,
+    spot_market: &str,
+) -> Option<Order> {
+    let Some((market_id, outcome)) = store.lookup_spot_market(spot_market).await else {
+        tracing::warn!(
+            spot_market,
+            order_id = %created.order_id,
+            "order_created for unknown spot market (book updated but order not indexed)"
+        );
         return None;
     };
 
@@ -513,6 +695,26 @@ async fn publish_user_order_cancelled(
     user_hub
         .publish_order(
             "cancellation",
+            &user_address,
+            chain_order_id,
+            order,
+            block_num,
+        )
+        .await;
+}
+
+async fn publish_user_order_updated(
+    user_hub: &SharedUserEventHub,
+    store: &SharedIndexStore,
+    chain_order_id: &str,
+    block_num: u64,
+) {
+    let Some((order, user_address, _)) = store.stored_order_by_chain_id(chain_order_id).await else {
+        return;
+    };
+    user_hub
+        .publish_order(
+            "update",
             &user_address,
             chain_order_id,
             order,

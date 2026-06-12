@@ -128,7 +128,15 @@ pub fn format_token_amount(raw: u64) -> String {
 
 pub fn format_price_pieces(raw: u64) -> String {
     use lightpool_sdk::TOKEN_SCALE;
-    ((raw.saturating_mul(100)) / TOKEN_SCALE).to_string()
+    let numerator = raw.saturating_mul(100);
+    let whole = numerator / TOKEN_SCALE;
+    let frac = numerator % TOKEN_SCALE;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac_str = format!("{frac:06}");
+    let trimmed = frac_str.trim_end_matches('0');
+    format!("{whole}.{trimmed}")
 }
 
 pub fn compute_question_hash(question: &str) -> [u8; 32] {

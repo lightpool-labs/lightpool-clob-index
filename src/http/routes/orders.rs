@@ -11,6 +11,7 @@ use crate::domain::Order;
 use crate::error::{AppError, AppResult};
 use crate::http::models::CancelContextResponse;
 use crate::indexer::{apply_order_created_to_book, index_order_created, publish_user_order_created};
+use crate::spot_market::normalize_spot_market_key;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -94,12 +95,24 @@ async fn index_from_event(
     Json(event): Json<OrderCreatedEvent>,
 ) -> AppResult<Json<Order>> {
     let chain_order_id = event.order_id.to_string();
+    let spot_market = normalize_spot_market_key(&event.market.to_string());
+    state
+        .index
+        .register_chain_order_spot(&chain_order_id, &spot_market)
+        .await;
     let is_new = !state.index.has_chain_order(&chain_order_id).await;
     if is_new {
-        apply_order_created_to_book(&state.book_store, 0, &event).await;
+        apply_order_created_to_book(
+            &state.book_store,
+            &state.index,
+            0,
+            &event,
+            &spot_market,
+        )
+        .await;
     }
 
-    let order = index_order_created(&state.index, event)
+    let order = index_order_created(&state.index, event, &spot_market)
         .await
         .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;
     if is_new {
