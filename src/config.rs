@@ -8,6 +8,7 @@ pub struct Config {
     pub lightpool_ws_url: String,
     pub enable_indexer: bool,
     pub query_account: String,
+    pub submit_queue_capacity: usize,
 }
 
 impl Config {
@@ -28,6 +29,10 @@ impl Config {
                 .unwrap_or(true),
             query_account: env::var("QUERY_ACCOUNT")
                 .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".into()),
+            submit_queue_capacity: env::var("SUBMIT_QUEUE_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024),
         }
     }
 }

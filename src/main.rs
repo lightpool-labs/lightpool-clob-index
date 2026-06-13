@@ -1,3 +1,4 @@
+mod book_hydrate;
 mod chain;
 mod config;
 mod domain;
@@ -7,13 +8,13 @@ mod indexer;
 mod slug;
 mod spot_market;
 mod state;
+mod submit_queue;
 mod ws;
 
 use std::net::SocketAddr;
 
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::Config;
@@ -25,7 +26,7 @@ async fn main() {
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| "lightpool_clob_index=debug,tower_http=debug".into(),
+            |_| "lightpool_clob_index=info,tower_http=warn".into(),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -35,11 +36,21 @@ async fn main() {
 
     if config.enable_indexer {
         let ws_url = config.lightpool_ws_url.clone();
+        let chain = state.chain.clone();
+        let query_account = config.query_account.clone();
         let head = state.indexed_head.clone();
         let index = state.index.clone();
         let book_store = state.book_store.clone();
         let user_hub = state.user_hub.clone();
-        let _indexer_handle = indexer::spawn(ws_url, head, index, book_store, user_hub);
+        let _indexer_handle = indexer::spawn(
+            ws_url,
+            chain,
+            query_account,
+            head,
+            index,
+            book_store,
+            user_hub,
+        );
         tracing::info!("block indexer started");
     } else {
         tracing::info!("block indexer disabled");
@@ -48,7 +59,6 @@ async fn main() {
     let app = Router::new()
         .nest("/api", http::router())
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)

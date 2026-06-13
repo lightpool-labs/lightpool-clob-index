@@ -17,3 +17,11 @@ pub fn normalize_spot_market_key(value: &str) -> String {
 
     trimmed.to_string()
 }
+
+pub fn chain_order_key(spot_market: &str, chain_order_id: &str) -> String {
+    format!(
+        "{}:{}",
+        normalize_spot_market_key(spot_market),
+        chain_order_id
+    )
+}

@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::domain::{Market, MarketQuery, MarketSortOrder, Order};
-use crate::spot_market::normalize_spot_market_key;
+use crate::spot_market::{chain_order_key, normalize_spot_market_key};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexedBlockHead {
@@ -33,6 +33,16 @@ pub(crate) struct StoredOrder {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrderQueryRecord {
+    pub order: Order,
+    pub chain_order_id: String,
+    pub spot_market: String,
+    pub user_address: String,
+    pub size_raw: u64,
+    pub filled_raw: u64,
+}
+
+#[derive(Debug, Clone)]
 struct QuestionEntry {
     question: String,
     slug: String,
@@ -47,7 +57,6 @@ struct IndexStoreInner {
     last_trade_price_by_spot: HashMap<String, u64>,
     orders: HashMap<Uuid, StoredOrder>,
     chain_order_index: HashMap<String, Uuid>,
-    chain_order_spot: HashMap<String, String>,
     question_by_hash: HashMap<String, QuestionEntry>,
 }
 
@@ -291,6 +300,11 @@ impl IndexStore {
             .map(|spot| (spot.market_id, spot.outcome.clone()))
     }
 
+    pub async fn list_spot_markets(&self) -> Vec<String> {
+        let inner = self.inner.read().await;
+        inner.spot_to_market.keys().cloned().collect()
+    }
+
     pub async fn record_last_trade_price(&self, spot_market: &str, price: u64) {
         let key = normalize_spot_market_key(spot_market);
         self.inner
@@ -310,36 +324,26 @@ impl IndexStore {
             .copied()
     }
 
-    pub async fn has_chain_order(&self, chain_order_id: &str) -> bool {
-        self.inner
-            .read()
-            .await
-            .chain_order_index
-            .contains_key(chain_order_id)
+    pub async fn has_chain_order(&self, spot_market: &str, chain_order_id: &str) -> bool {
+        let key = chain_order_key(spot_market, chain_order_id);
+        self.inner.read().await.chain_order_index.contains_key(&key)
     }
 
-    pub async fn register_chain_order_spot(&self, chain_order_id: &str, spot_market: &str) {
-        let key = normalize_spot_market_key(spot_market);
-        self.inner
-            .write()
-            .await
-            .chain_order_spot
-            .insert(chain_order_id.to_string(), key);
-    }
-
-    pub async fn spot_market_for_chain_order(&self, chain_order_id: &str) -> Option<String> {
+    pub async fn lookup_spot_market_for_chain_order(&self, chain_order_id: &str) -> Option<String> {
         let inner = self.inner.read().await;
-        if let Some(spot) = inner.chain_order_spot.get(chain_order_id) {
-            return Some(spot.clone());
+        let suffix = format!(":{chain_order_id}");
+        let mut matches = inner
+            .chain_order_index
+            .keys()
+            .filter(|key| key.ends_with(&suffix))
+            .filter_map(|key| key.strip_suffix(&suffix))
+            .map(str::to_string);
+
+        let spot = matches.next()?;
+        if matches.next().is_some() {
+            return None;
         }
-        let order_id = inner.chain_order_index.get(chain_order_id)?;
-        let stored = inner.orders.get(order_id)?;
-        let market = inner.markets.get(&stored.order.market_id)?;
-        if stored.order.outcome == "yes" {
-            Some(market.yes_spot_market.clone())
-        } else {
-            Some(market.no_spot_market.clone())
-        }
+        Some(spot)
     }
 
     pub async fn order_cancel_context(
@@ -372,6 +376,7 @@ impl IndexStore {
         &self,
         order: Order,
         user_address: String,
+        spot_market: &str,
         chain_order_id: String,
         size_raw: u64,
     ) {
@@ -382,34 +387,103 @@ impl IndexStore {
             filled_raw: 0,
             size_raw,
         };
+        let key = chain_order_key(spot_market, &chain_order_id);
         let mut inner = self.inner.write().await;
-        inner.chain_order_index.insert(chain_order_id, order.id);
+        inner.chain_order_index.insert(key, order.id);
         inner.orders.insert(order.id, stored);
+    }
+
+    pub async fn query_order_by_chain_id(
+        &self,
+        spot_market: &str,
+        chain_order_id: &str,
+        user_address: Option<&str>,
+    ) -> Option<OrderQueryRecord> {
+        let key = chain_order_key(spot_market, chain_order_id);
+        let inner = self.inner.read().await;
+        let order_id = inner.chain_order_index.get(&key)?;
+        let stored = inner.orders.get(order_id)?;
+        if let Some(user) = user_address {
+            if !stored.user_address.eq_ignore_ascii_case(user) {
+                return None;
+            }
+        }
+        Some(Self::order_query_record(
+            stored,
+            normalize_spot_market_key(spot_market),
+        ))
+    }
+
+    pub async fn find_open_order_match(
+        &self,
+        spot_market: &str,
+        user_address: &str,
+        side: &str,
+        price: &str,
+        size_raw: u64,
+    ) -> Option<OrderQueryRecord> {
+        let spot = normalize_spot_market_key(spot_market);
+        let inner = self.inner.read().await;
+        for stored in inner.orders.values() {
+            if !stored.user_address.eq_ignore_ascii_case(user_address) {
+                continue;
+            }
+            if stored.order.status != "open" && stored.order.status != "partial_filled" {
+                continue;
+            }
+            let Some(market) = inner.markets.get(&stored.order.market_id) else {
+                continue;
+            };
+            let order_spot = if stored.order.outcome == "yes" {
+                &market.yes_spot_market
+            } else {
+                &market.no_spot_market
+            };
+            if normalize_spot_market_key(order_spot) != spot {
+                continue;
+            }
+            if stored.order.side != side || stored.order.price != price {
+                continue;
+            }
+            if stored.size_raw != size_raw {
+                continue;
+            }
+            return Some(Self::order_query_record(stored, spot.clone()));
+        }
+        None
+    }
+
+    fn order_query_record(stored: &StoredOrder, spot_market: String) -> OrderQueryRecord {
+        OrderQueryRecord {
+            order: stored.order.clone(),
+            chain_order_id: stored.chain_order_id.clone(),
+            spot_market,
+            user_address: stored.user_address.clone(),
+            size_raw: stored.size_raw,
+            filled_raw: stored.filled_raw,
+        }
     }
 
     pub async fn stored_order_by_chain_id(
         &self,
+        spot_market: &str,
         chain_order_id: &str,
     ) -> Option<(Order, String, String)> {
         let inner = self.inner.read().await;
-        let order_id = inner.chain_order_index.get(chain_order_id)?;
+        let key = chain_order_key(spot_market, chain_order_id);
+        let order_id = inner.chain_order_index.get(&key)?;
         let stored = inner.orders.get(order_id)?;
-        let market = inner.markets.get(&stored.order.market_id)?;
-        let spot_market = if stored.order.outcome == "yes" {
-            market.yes_spot_market.clone()
-        } else {
-            market.no_spot_market.clone()
-        };
         Some((
             stored.order.clone(),
             stored.user_address.clone(),
-            spot_market,
+            normalize_spot_market_key(spot_market),
         ))
     }
 
-    pub async fn update_order_cancelled(&self, chain_order_id: &str) {
+    pub async fn update_order_cancelled(&self, spot_market: &str, chain_order_id: &str) {
         let mut inner = self.inner.write().await;
-        let Some(order_id) = inner.chain_order_index.get(chain_order_id).copied() else {
+        let key = chain_order_key(spot_market, chain_order_id);
+        let Some(order_id) = inner.chain_order_index.get(&key).copied() else {
             return;
         };
         if let Some(stored) = inner.orders.get_mut(&order_id) {
@@ -419,12 +493,14 @@ impl IndexStore {
 
     pub async fn update_order_amount(
         &self,
+        spot_market: &str,
         chain_order_id: &str,
         new_amount: u64,
         remaining_amount: u64,
     ) {
         let mut inner = self.inner.write().await;
-        let Some(order_id) = inner.chain_order_index.get(chain_order_id).copied() else {
+        let key = chain_order_key(spot_market, chain_order_id);
+        let Some(order_id) = inner.chain_order_index.get(&key).copied() else {
             return;
         };
         let Some(stored) = inner.orders.get_mut(&order_id) else {
@@ -444,13 +520,15 @@ impl IndexStore {
 
     pub async fn update_order_fill(
         &self,
+        spot_market: &str,
         chain_order_id: &str,
         fill_amount: u64,
         remaining_amount: u64,
         is_fully_filled: bool,
     ) {
         let mut inner = self.inner.write().await;
-        let Some(order_id) = inner.chain_order_index.get(chain_order_id).copied() else {
+        let key = chain_order_key(spot_market, chain_order_id);
+        let Some(order_id) = inner.chain_order_index.get(&key).copied() else {
             return;
         };
         let Some(stored) = inner.orders.get_mut(&order_id) else {

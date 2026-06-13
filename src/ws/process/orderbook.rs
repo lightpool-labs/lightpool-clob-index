@@ -2,7 +2,7 @@ use axum::extract::ws::Message;
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
 
-use crate::http::process::ensure_hydrated;
+use crate::book_hydrate::rehydrate_spot_from_chain;
 use crate::state::AppState;
 use crate::ws::models::{ws_error, ws_subscribed, ws_unsubscribed, CHANNEL_ORDERBOOK_DELTA};
 use crate::ws::process::WsSession;
@@ -12,16 +12,24 @@ pub async fn handle_subscribe(
     sender: &mut SplitSink<axum::extract::ws::WebSocket, Message>,
     session: &mut WsSession,
     spot_market: &str,
-    depth: u32,
+    _depth: u32,
 ) -> bool {
-    if let Err(error) = ensure_hydrated(state, spot_market, depth).await {
+    if let Err(error) = rehydrate_spot_from_chain(
+        &state.chain,
+        &state.book_store,
+        &state.index,
+        &state.config.query_account,
+        spot_market,
+    )
+    .await
+    {
         let _ = sender
             .send(Message::Text(ws_error(error.to_string()).into()))
             .await;
         return true;
     }
 
-    if let Some(snapshot) = state.book_store.ws_snapshot(spot_market, depth).await {
+    if let Some(snapshot) = state.book_store.ws_snapshot(spot_market, _depth).await {
         let text = serde_json::to_string(&snapshot).unwrap_or_default();
         if sender.send(Message::Text(text.into())).await.is_err() {
             return false;

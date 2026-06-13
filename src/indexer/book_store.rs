@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use lightpool_sdk::lightpool_types::call::GetOrderBook;
@@ -23,6 +23,7 @@ struct SpotBook {
 #[derive(Default)]
 struct BookStoreInner {
     books: HashMap<String, SpotBook>,
+    chain_hydrated: HashSet<String>,
     publishers: HashMap<String, broadcast::Sender<OrderBookDelta>>,
     quote_publishers: HashMap<String, broadcast::Sender<QuoteDelta>>,
 }
@@ -85,9 +86,9 @@ impl BookStore {
         Some(Self::book_to_quote_snapshot(&key, book))
     }
 
-    pub async fn is_hydrated(&self, spot_market: &str) -> bool {
+    pub async fn is_chain_hydrated(&self, spot_market: &str) -> bool {
         let key = Self::key(spot_market);
-        self.inner.read().await.books.contains_key(&key)
+        self.inner.read().await.chain_hydrated.contains(&key)
     }
 
     pub async fn hydrate_from_chain(
@@ -100,7 +101,7 @@ impl BookStore {
         let mut inner = self.inner.write().await;
         let book = inner
             .books
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(SpotBook::default);
 
         book.bids.clear();
@@ -119,6 +120,7 @@ impl BookStore {
         if let Some(price) = last_trade_price {
             book.last_trade_price = Some(price);
         }
+        inner.chain_hydrated.insert(key);
     }
 
     pub async fn apply_created(

@@ -2,7 +2,7 @@ use axum::extract::ws::Message;
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
 
-use crate::http::process::ensure_hydrated;
+use crate::book_hydrate::rehydrate_spot_from_chain;
 use crate::state::AppState;
 use crate::ws::models::{ws_error, ws_subscribed, ws_unsubscribed, CHANNEL_QUOTE};
 use crate::ws::process::WsSession;
@@ -13,7 +13,15 @@ pub async fn handle_subscribe(
     session: &mut WsSession,
     spot_market: &str,
 ) -> bool {
-    if let Err(error) = ensure_hydrated(state, spot_market, 1).await {
+    if let Err(error) = rehydrate_spot_from_chain(
+        &state.chain,
+        &state.book_store,
+        &state.index,
+        &state.config.query_account,
+        spot_market,
+    )
+    .await
+    {
         let _ = sender
             .send(Message::Text(ws_error(error.to_string()).into()))
             .await;

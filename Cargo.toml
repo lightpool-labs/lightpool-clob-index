@@ -5,6 +5,7 @@ name = "lightpool-clob-index"
 version = "0.1.0"
 edition = "2021"
 publish = false
+rust-version = "1.96.0"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }

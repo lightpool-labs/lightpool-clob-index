@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::domain::Order;
 use crate::error::{AppError, AppResult};
-use crate::http::models::CancelContextResponse;
+use crate::http::models::{CancelContextResponse, OrderQueryResponse};
 use crate::indexer::{apply_order_created_to_book, index_order_created, publish_user_order_created};
 use crate::spot_market::normalize_spot_market_key;
 use crate::state::AppState;
@@ -17,6 +17,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_orders))
+        .route("/query", get(query_order))
         .route("/:id/cancel-context", get(cancel_context))
         .route("/:id/cancelled", post(mark_cancelled))
         .route("/index/from-event", post(index_from_event))
@@ -30,6 +31,16 @@ pub struct ListOrdersQuery {
 #[derive(Debug, Deserialize)]
 pub struct CancelContextQuery {
     pub user_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryOrderQuery {
+    pub spot_market: String,
+    pub chain_order_id: Option<String>,
+    pub user_address: Option<String>,
+    pub side: Option<String>,
+    pub price: Option<String>,
+    pub size_raw: Option<u64>,
 }
 
 async fn list_orders(
@@ -57,6 +68,59 @@ async fn list_orders(
     Json(orders)
 }
 
+async fn query_order(
+    State(state): State<AppState>,
+    Query(query): Query<QueryOrderQuery>,
+) -> AppResult<Json<OrderQueryResponse>> {
+    let spot_market = normalize_spot_market_key(&query.spot_market);
+
+    let record = if let Some(chain_order_id) = query.chain_order_id.as_deref() {
+        state
+            .index
+            .query_order_by_chain_id(
+                &spot_market,
+                chain_order_id,
+                query.user_address.as_deref(),
+            )
+            .await
+    } else {
+        let user_address = query
+            .user_address
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("user_address is required".into()))?;
+        let side = query
+            .side
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("side is required".into()))?;
+        let price = query
+            .price
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("price is required".into()))?;
+        let size_raw = query
+            .size_raw
+            .ok_or_else(|| AppError::BadRequest("size_raw is required".into()))?;
+        state
+            .index
+            .find_open_order_match(&spot_market, user_address, side, price, size_raw)
+            .await
+    };
+
+    let Some(record) = record else {
+        return Err(AppError::NotFound(format!(
+            "order not found for spot market {spot_market}"
+        )));
+    };
+
+    Ok(Json(OrderQueryResponse {
+        order: record.order,
+        chain_order_id: record.chain_order_id,
+        spot_market: record.spot_market,
+        user_address: record.user_address,
+        size_raw: record.size_raw,
+        filled_raw: record.filled_raw,
+    }))
+}
+
 async fn cancel_context(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -80,13 +144,16 @@ async fn mark_cancelled(
     Path(id): Path<Uuid>,
     Query(query): Query<CancelContextQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (_, chain_order_id, _) = state
+    let (_, chain_order_id, spot_market) = state
         .index
         .order_cancel_context(id, &query.user_address)
         .await
         .ok_or_else(|| AppError::NotFound(format!("open order {id} not found")))?;
 
-    state.index.update_order_cancelled(&chain_order_id).await;
+    state
+        .index
+        .update_order_cancelled(&spot_market, &chain_order_id)
+        .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -96,11 +163,10 @@ async fn index_from_event(
 ) -> AppResult<Json<Order>> {
     let chain_order_id = event.order_id.to_string();
     let spot_market = normalize_spot_market_key(&event.market.to_string());
-    state
+    let is_new = !state
         .index
-        .register_chain_order_spot(&chain_order_id, &spot_market)
+        .has_chain_order(&spot_market, &chain_order_id)
         .await;
-    let is_new = !state.index.has_chain_order(&chain_order_id).await;
     if is_new {
         apply_order_created_to_book(
             &state.book_store,
@@ -116,7 +182,14 @@ async fn index_from_event(
         .await
         .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;
     if is_new {
-        publish_user_order_created(&state.user_hub, &state.index, &chain_order_id, 0).await;
+        publish_user_order_created(
+            &state.user_hub,
+            &state.index,
+            &spot_market,
+            &chain_order_id,
+            0,
+        )
+        .await;
     }
     Ok(Json(order))
 }

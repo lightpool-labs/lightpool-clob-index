@@ -12,7 +12,7 @@ async fn submit_transaction(
     State(state): State<AppState>,
     Json(body): Json<SubmitTxRequest>,
 ) -> AppResult<Json<SubmitTxResponse>> {
-    let response = state.chain.submit_transaction(body.tx).await?;
+    let response = state.submit_queue.submit(body.tx).await?;
 
     if !response.receipt.is_success() {
         return Err(AppError::Internal(format!(

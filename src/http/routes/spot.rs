@@ -9,7 +9,6 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::http::models::{BookResponse, MarketInfoResponse};
-use crate::http::process::ensure_hydrated;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -45,7 +44,14 @@ async fn get_book(
 ) -> AppResult<Json<BookResponse>> {
     let depth = query.depth.unwrap_or(10).clamp(1, 50);
 
-    ensure_hydrated(&state, &spot_market, depth).await?;
+    crate::book_hydrate::rehydrate_spot_from_chain(
+        &state.chain,
+        &state.book_store,
+        &state.index,
+        &state.config.query_account,
+        &spot_market,
+    )
+    .await?;
 
     let book = state
         .book_store

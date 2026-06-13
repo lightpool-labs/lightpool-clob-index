@@ -14,6 +14,7 @@ pub use store::{IndexStore, SharedIndexStore, SharedIndexedBlockHead, new_head};
 
 pub use book_store::SharedBookStore;
 
+use crate::book_hydrate::{hydrate_all_spot_markets, SharedChainClient};
 use crate::error::{AppError, AppResult};
 use crate::ws::process::SharedUserEventHub;
 
@@ -21,6 +22,8 @@ use processor::process_block;
 
 pub fn spawn(
     ws_url: String,
+    chain: SharedChainClient,
+    query_account: String,
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
     book_store: SharedBookStore,
@@ -30,6 +33,8 @@ pub fn spawn(
         loop {
             match run_once(
                 &ws_url,
+                &chain,
+                &query_account,
                 head.clone(),
                 index.clone(),
                 book_store.clone(),
@@ -57,11 +62,17 @@ pub fn spawn(
 
 async fn run_once(
     ws_url: &str,
+    chain: &SharedChainClient,
+    query_account: &str,
     head: SharedIndexedBlockHead,
     index: SharedIndexStore,
     book_store: SharedBookStore,
     user_hub: SharedUserEventHub,
 ) -> AppResult<()> {
+    if let Err(error) = hydrate_all_spot_markets(chain, &book_store, &index, query_account).await {
+        tracing::warn!(error = %error, "startup spot market hydration failed");
+    }
+
     let mut client = WebSocketClient::new(Some(ws_url.to_string()))
         .await
         .map_err(|e| AppError::Internal(format!("create ws client: {e}")))?;
@@ -86,9 +97,15 @@ async fn run_once(
                 let digest = hex::encode(block.digest.as_bytes());
                 let tx_count = block.transaction_outputs.len();
 
-                tracing::info!(block_num, tx_count, "processing block");
-
-                process_block(&index, &book_store, &user_hub, block).await;
+                process_block(
+                    chain,
+                    query_account,
+                    &index,
+                    &book_store,
+                    &user_hub,
+                    block,
+                )
+                .await;
 
                 let mut state = head.write().await;
                 state.block_num = block_num;
