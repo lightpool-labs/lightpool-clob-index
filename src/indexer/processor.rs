@@ -19,6 +19,7 @@ use crate::book_hydrate::{
 };
 use crate::chain::{format_price_pieces, format_token_amount};
 use crate::domain::{Market, Order};
+use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
 use super::book_store::SharedBookStore;
@@ -57,8 +58,21 @@ pub async fn process_block(
     store: &SharedIndexStore,
     book_store: &SharedBookStore,
     user_hub: &SharedUserEventHub,
+    submit_wait: &SharedSubmitWaitRegistry,
     block: VerifiedBlock,
 ) {
+    for tx_result in &block.transaction_outputs {
+        // Match submit_queue register key: SignedTransaction digest (tx + signature).
+        // receipt.transaction_digest is the unsigned Transaction digest from execution.
+        let digest = hex::encode(tx_result.transaction.digest().as_bytes());
+        if !submit_wait.complete(&digest, tx_result.receipt.clone()) {
+            tracing::debug!(
+                digest,
+                "no pending submit waiter for transaction digest"
+            );
+        }
+    }
+
     let block_num = block.block_num;
     let mut sync_stats = BlockOrderSyncStats::default();
 

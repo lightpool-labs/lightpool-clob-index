@@ -15,6 +15,8 @@ pub enum AppError {
     Internal(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    #[error("submit timeout: {0}")]
+    Timeout(String),
 }
 
 impl IntoResponse for AppError {
@@ -24,6 +26,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg.clone()),
         };
 
         (status, Json(json!({ "error": message }))).into_response()

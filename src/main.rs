@@ -5,10 +5,12 @@ mod domain;
 mod error;
 mod http;
 mod indexer;
+mod mempool_client;
 mod slug;
 mod spot_market;
 mod state;
 mod submit_queue;
+mod submit_wait;
 mod ws;
 
 use std::net::SocketAddr;
@@ -50,6 +52,7 @@ async fn main() {
             index,
             book_store,
             user_hub,
+            state.submit_wait.clone(),
         );
         tracing::info!("block indexer started");
     } else {

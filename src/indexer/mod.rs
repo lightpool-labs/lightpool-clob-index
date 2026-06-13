@@ -16,6 +16,7 @@ pub use book_store::SharedBookStore;
 
 use crate::book_hydrate::{hydrate_all_spot_markets, SharedChainClient};
 use crate::error::{AppError, AppResult};
+use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
 use processor::process_block;
@@ -28,6 +29,7 @@ pub fn spawn(
     index: SharedIndexStore,
     book_store: SharedBookStore,
     user_hub: SharedUserEventHub,
+    submit_wait: SharedSubmitWaitRegistry,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -39,6 +41,7 @@ pub fn spawn(
                 index.clone(),
                 book_store.clone(),
                 user_hub.clone(),
+                submit_wait.clone(),
             )
             .await
             {
@@ -68,6 +71,7 @@ async fn run_once(
     index: SharedIndexStore,
     book_store: SharedBookStore,
     user_hub: SharedUserEventHub,
+    submit_wait: SharedSubmitWaitRegistry,
 ) -> AppResult<()> {
     if let Err(error) = hydrate_all_spot_markets(chain, &book_store, &index, query_account).await {
         tracing::warn!(error = %error, "startup spot market hydration failed");
@@ -103,6 +107,7 @@ async fn run_once(
                     &index,
                     &book_store,
                     &user_hub,
+                    &submit_wait,
                     block,
                 )
                 .await;

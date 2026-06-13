@@ -1,15 +1,22 @@
-use std::sync::Arc;
+use std::time::Duration;
 
-use lightpool_sdk::lightpool_types::SignedTransaction;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use lightpool_sdk::lightpool_types::{SignedTransaction, TransactionReceipt};
 use lightpool_sdk::types::SubmitTransactionResponse;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::chain::ChainClient;
 use crate::error::{AppError, AppResult};
+use crate::mempool_client::MempoolClient;
+use crate::submit_wait::SharedSubmitWaitRegistry;
 
 struct SubmitJob {
     tx: SignedTransaction,
     respond_to: oneshot::Sender<AppResult<SubmitTransactionResponse>>,
+}
+
+pub struct SubmitQueueConfig {
+    pub capacity: usize,
+    pub wait_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -18,20 +25,57 @@ pub struct SubmitQueue {
 }
 
 impl SubmitQueue {
-    pub fn spawn(chain: Arc<ChainClient>, capacity: usize) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<SubmitJob>(capacity);
+    pub fn spawn(
+        mempool: MempoolClient,
+        submit_wait: SharedSubmitWaitRegistry,
+        config: SubmitQueueConfig,
+    ) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<SubmitJob>(config.capacity);
+        let wait_timeout = config.wait_timeout;
 
         tokio::spawn(async move {
-            while let Some(job) = receiver.recv().await {
-                let result = chain.submit_transaction(job.tx).await;
-                if job.respond_to.send(result).is_err() {
-                    tracing::warn!("submit queue client dropped before response was sent");
+            let mut waiting = FuturesUnordered::new();
+
+            loop {
+                tokio::select! {
+                    Some(job) = receiver.recv() => {
+                        let digest_hex = hex::encode(job.tx.digest().as_bytes());
+                        let receipt_rx = submit_wait.register(&digest_hex);
+                        let mempool = mempool.clone();
+                        let submit_wait = submit_wait.clone();
+                        let tx = job.tx;
+                        let respond_to = job.respond_to;
+
+                        waiting.push(async move {
+                            let result = submit_and_wait(
+                                &mempool,
+                                &submit_wait,
+                                &digest_hex,
+                                tx,
+                                receipt_rx,
+                                wait_timeout,
+                            )
+                            .await;
+                            (respond_to, result)
+                        });
+                    }
+                    Some((respond_to, result)) = waiting.next() => {
+                        if respond_to.send(result).is_err() {
+                            tracing::warn!("submit client dropped before response was sent");
+                        }
+                    }
+                    else => break,
                 }
             }
-            tracing::error!("submit queue worker stopped");
+
+            tracing::error!("submit queue dispatcher stopped");
         });
 
-        tracing::info!("submit queue worker started capacity={capacity}");
+        tracing::info!(
+            capacity = config.capacity,
+            wait_timeout_ms = wait_timeout.as_millis(),
+            "submit queue dispatcher started"
+        );
         Self { sender }
     }
 
@@ -44,6 +88,42 @@ impl SubmitQueue {
 
         response_rx
             .await
-            .map_err(|_| AppError::Internal("submit queue worker dropped".into()))?
+            .map_err(|_| AppError::Internal("submit task dropped".into()))?
+    }
+}
+
+async fn submit_and_wait(
+    mempool: &MempoolClient,
+    submit_wait: &SharedSubmitWaitRegistry,
+    digest_hex: &str,
+    tx: SignedTransaction,
+    receipt_rx: oneshot::Receiver<TransactionReceipt>,
+    wait_timeout: Duration,
+) -> AppResult<SubmitTransactionResponse> {
+    if let Err(error) = mempool.submit_transaction(&tx).await {
+        submit_wait.cancel(digest_hex);
+        return Err(error);
+    }
+
+    match tokio::time::timeout(wait_timeout, receipt_rx).await {
+        Ok(Ok(receipt)) => {
+            tracing::debug!(digest = digest_hex, "transaction receipt received via indexer");
+            Ok(SubmitTransactionResponse {
+                digest: digest_hex.to_string(),
+                receipt,
+            })
+        }
+        Ok(Err(_)) => {
+            submit_wait.cancel(digest_hex);
+            Err(AppError::Internal(format!(
+                "submit waiter dropped for transaction {digest_hex}"
+            )))
+        }
+        Err(_) => {
+            submit_wait.cancel(digest_hex);
+            Err(AppError::Timeout(format!(
+                "timed out waiting for transaction {digest_hex} to be committed"
+            )))
+        }
     }
 }
