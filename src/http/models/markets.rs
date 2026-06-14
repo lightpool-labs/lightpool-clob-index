@@ -1,24 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::domain::Market;
-
-#[derive(Debug, Deserialize)]
-pub struct RegisterQuestionRequest {
-    pub question: String,
-    pub slug: String,
-    #[serde(default)]
-    pub icon_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AllocateSlugRequest {
-    pub question: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SlugResponse {
-    pub slug: String,
-}
 
 #[derive(Debug, Serialize)]
 pub struct MarketsPageResponse {

@@ -42,13 +42,6 @@ pub struct OrderQueryRecord {
     pub filled_raw: u64,
 }
 
-#[derive(Debug, Clone)]
-struct QuestionEntry {
-    question: String,
-    slug: String,
-    icon_url: Option<String>,
-}
-
 #[derive(Default)]
 struct IndexStoreInner {
     markets: HashMap<Uuid, Market>,
@@ -57,7 +50,6 @@ struct IndexStoreInner {
     last_trade_price_by_spot: HashMap<String, u64>,
     orders: HashMap<Uuid, StoredOrder>,
     chain_order_index: HashMap<String, Uuid>,
-    question_by_hash: HashMap<String, QuestionEntry>,
 }
 
 pub struct IndexStore {
@@ -157,7 +149,7 @@ impl IndexStore {
             .and_then(|id| inner.markets.get(id).cloned())
     }
 
-    pub async fn allocate_slug(&self, question: &str) -> String {
+    pub async fn allocate_market_slug(&self, question: &str) -> String {
         let inner = self.inner.read().await;
         let existing_slugs: Vec<String> = inner.slug_to_market_id.keys().cloned().collect();
         crate::slug::allocate_unique_slug(&existing_slugs, question)
@@ -173,53 +165,6 @@ impl IndexStore {
             .collect()
     }
 
-    pub async fn register_question(&self, question: &str, slug: &str, icon_url: Option<String>) {
-        let hash = crate::chain::compute_question_hash(question);
-        let key = hex::encode(hash);
-        self.inner.write().await.question_by_hash.insert(
-            key,
-            QuestionEntry {
-                question: question.to_string(),
-                slug: slug.to_string(),
-                icon_url,
-            },
-        );
-    }
-
-    pub async fn question_for_hash(&self, hash: &[u8; 32]) -> Option<String> {
-        let key = hex::encode(hash);
-        self.inner
-            .read()
-            .await
-            .question_by_hash
-            .get(&key)
-            .map(|entry| entry.question.clone())
-    }
-
-    pub async fn slug_for_hash(&self, hash: &[u8; 32]) -> Option<String> {
-        let key = hex::encode(hash);
-        self.inner
-            .read()
-            .await
-            .question_by_hash
-            .get(&key)
-            .map(|entry| entry.slug.clone())
-            .filter(|slug| !slug.is_empty())
-    }
-
-    pub async fn icon_url_for_hash(&self, hash: &[u8; 32]) -> Option<String> {
-        let key = hex::encode(hash);
-        self.inner
-            .read()
-            .await
-            .question_by_hash
-            .get(&key)
-            .and_then(|entry| entry.icon_url.clone())
-    }
-
-    fn remove_slug_mappings_for_market(inner: &mut IndexStoreInner, market_id: Uuid) {
-        inner.slug_to_market_id.retain(|_, id| *id != market_id);
-    }
 
     pub async fn position_token_specs(&self) -> Vec<(String, String)> {
         let inner = self.inner.read().await;
@@ -231,6 +176,10 @@ impl IndexStore {
         }
 
         specs
+    }
+
+    fn remove_slug_mappings_for_market(inner: &mut IndexStoreInner, market_id: Uuid) {
+        inner.slug_to_market_id.retain(|_, id| *id != market_id);
     }
 
     pub async fn upsert_market(&self, mut market: Market) {
@@ -550,10 +499,5 @@ pub fn new_head() -> SharedIndexedBlockHead {
 
 pub fn market_uuid(market_address: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, market_address.as_bytes())
-}
-
-pub fn question_from_hash(hash: &[u8; 32]) -> String {
-    let end = hash.iter().position(|&b| b == 0).unwrap_or(32);
-    String::from_utf8_lossy(&hash[..end]).trim().to_string()
 }
 

@@ -138,11 +138,3 @@ pub fn format_price_pieces(raw: u64) -> String {
     let trimmed = frac_str.trim_end_matches('0');
     format!("{whole}.{trimmed}")
 }
-
-pub fn compute_question_hash(question: &str) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    let bytes = question.as_bytes();
-    let len = bytes.len().min(32);
-    hash[..len].copy_from_slice(&bytes[..len]);
-    hash
-}

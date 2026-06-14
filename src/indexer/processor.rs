@@ -23,7 +23,7 @@ use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
 use super::book_store::SharedBookStore;
-use super::store::{market_uuid, question_from_hash, SharedIndexStore};
+use super::store::{market_uuid, SharedIndexStore};
 
 fn spot_market_from_event_contract(event: &TransactionEvent) -> Option<String> {
     event
@@ -446,10 +446,9 @@ fn format_event_detail(event: &TransactionEvent) -> String {
     match action {
         "event_contract_created" => {
             if let Ok(e) = bincode::deserialize::<EventContractCreatedEvent>(bytes) {
-                let question = question_from_hash(&e.question_hash);
                 return format!(
                     "event_contract_created: question={} market={} yes={} no={} collateral={} deadline={} state={}",
-                    question,
+                    e.question,
                     e.market_address,
                     e.yes_token,
                     e.no_token,
@@ -691,15 +690,9 @@ async fn index_market_created(
     created: EventContractCreatedEvent,
 ) {
     let market_address = created.market_address.to_string();
-    let question = store
-        .question_for_hash(&created.question_hash)
-        .await
-        .unwrap_or_else(|| question_from_hash(&created.question_hash));
-    let slug = store
-        .slug_for_hash(&created.question_hash)
-        .await
-        .unwrap_or_else(|| crate::slug::slug_from_question(&question));
-    let icon_url = store.icon_url_for_hash(&created.question_hash).await;
+    let question = created.question.clone();
+    let slug = store.allocate_market_slug(&question).await;
+    let icon_url = None;
 
     let market = Market {
         id: market_uuid(&market_address),
