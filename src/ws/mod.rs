@@ -39,23 +39,39 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let Some(result) = incoming else {
                     break;
                 };
-                let Ok(Message::Text(text)) = result else {
-                    break;
-                };
 
-                let request = match serde_json::from_str::<WsRequest>(&text) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if out_tx.send(Message::Text(ws_error(format!("invalid message: {error}")).into())).is_err() {
+                match result {
+                    Ok(Message::Text(text)) => {
+                        let request = match serde_json::from_str::<WsRequest>(&text) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if out_tx
+                                    .send(Message::Text(
+                                        ws_error(format!("invalid message: {error}")).into(),
+                                    ))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+
+                        let keep_alive =
+                            handle_request(&state, &mut sender, &mut session, request).await;
+                        if !keep_alive {
                             break;
                         }
-                        continue;
                     }
-                };
-
-                let keep_alive = handle_request(&state, &mut sender, &mut session, request).await;
-                if !keep_alive {
-                    break;
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Binary(_)) => {}
+                    Err(_) => break,
                 }
             }
             outbound = out_rx.recv() => {

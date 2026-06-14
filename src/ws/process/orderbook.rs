@@ -37,7 +37,12 @@ pub async fn handle_subscribe(
     }
 
     let rx = state.book_store.subscribe(spot_market).await;
-    session.subscribe_orderbook(spot_market.to_string(), rx);
+    session.subscribe_orderbook(
+        spot_market.to_string(),
+        rx,
+        state.book_store.clone(),
+        _depth,
+    );
 
     let _ = sender
         .send(Message::Text(

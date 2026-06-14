@@ -51,7 +51,7 @@ impl BookStore {
         let sender = inner
             .publishers
             .entry(key.clone())
-            .or_insert_with(|| broadcast::channel(256).0);
+            .or_insert_with(|| broadcast::channel(4096).0);
         sender.subscribe()
     }
 
@@ -61,7 +61,7 @@ impl BookStore {
         let sender = inner
             .quote_publishers
             .entry(key)
-            .or_insert_with(|| broadcast::channel(256).0);
+            .or_insert_with(|| broadcast::channel(4096).0);
         sender.subscribe()
     }
 
@@ -182,20 +182,28 @@ impl BookStore {
         price_raw: u64,
         old_amount_raw: u64,
         new_amount_raw: u64,
+        new_remaining_raw: u64,
         block_num: u64,
     ) {
-        if price_raw == 0 || old_amount_raw == new_amount_raw {
+        if price_raw == 0 {
             return;
         }
+
+        let filled = new_amount_raw.saturating_sub(new_remaining_raw);
+        let old_remaining_raw = old_amount_raw.saturating_sub(filled);
+        if old_remaining_raw == new_remaining_raw {
+            return;
+        }
+
         let key = Self::key(spot_market);
         let mut inner = self.inner.write().await;
-        let delta = if new_amount_raw > old_amount_raw {
+        let delta = if new_remaining_raw > old_remaining_raw {
             Self::apply_level_change(
                 &mut inner,
                 &key,
                 side,
                 price_raw,
-                new_amount_raw - old_amount_raw,
+                new_remaining_raw - old_remaining_raw,
                 true,
                 block_num,
                 None,
@@ -206,7 +214,7 @@ impl BookStore {
                 &key,
                 side,
                 price_raw,
-                old_amount_raw - new_amount_raw,
+                old_remaining_raw - new_remaining_raw,
                 false,
                 block_num,
                 None,

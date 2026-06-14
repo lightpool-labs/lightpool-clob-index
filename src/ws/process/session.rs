@@ -4,6 +4,8 @@ use axum::extract::ws::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::indexer::SharedBookStore;
+use crate::spot_market::normalize_spot_market_key;
 use crate::ws::models::{OrderBookDelta, QuoteDelta, UserWsMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -30,9 +32,12 @@ impl WsSession {
         &mut self,
         spot_market: String,
         mut rx: broadcast::Receiver<OrderBookDelta>,
+        book_store: SharedBookStore,
+        depth: u32,
     ) {
         self.cancel(SubscriptionKey::Orderbook(spot_market.clone()));
         let outbound = self.outbound.clone();
+        let normalized_spot_market = normalize_spot_market_key(&spot_market);
         let handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -43,7 +48,22 @@ impl WsSession {
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            spot_market = normalized_spot_market,
+                            skipped,
+                            "orderbook delta receiver lagged; sending snapshot resync"
+                        );
+                        if let Some(snapshot) = book_store
+                            .ws_snapshot(&normalized_spot_market, depth)
+                            .await
+                        {
+                            let text = serde_json::to_string(&snapshot).unwrap_or_default();
+                            if outbound.send(Message::Text(text.into())).is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });

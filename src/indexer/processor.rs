@@ -252,16 +252,34 @@ pub async fn process_block(
                                 .await
                             {
                                 Some(spot_market) => {
-                                    book_store
-                                        .apply_updated(
-                                            &spot_market,
-                                            updated.side,
-                                            updated.price,
-                                            updated.old_amount,
-                                            updated.new_amount,
-                                            block_num,
-                                        )
-                                        .await;
+                                    if let Err(error) = ensure_chain_hydrated(
+                                        chain,
+                                        book_store,
+                                        store,
+                                        query_account,
+                                        &spot_market,
+                                        DEFAULT_BOOK_DEPTH,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            spot_market,
+                                            error = %error,
+                                            "failed to hydrate book before order_updated"
+                                        );
+                                    } else {
+                                        book_store
+                                            .apply_updated(
+                                                &spot_market,
+                                                updated.side,
+                                                updated.price,
+                                                updated.old_amount,
+                                                updated.new_amount,
+                                                updated.remaining_amount,
+                                                block_num,
+                                            )
+                                            .await;
+                                    }
                                     store
                                         .update_order_amount(
                                             &spot_market,
