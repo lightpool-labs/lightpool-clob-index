@@ -61,7 +61,9 @@ impl SubmitQueue {
                     }
                     Some((respond_to, result)) = waiting.next() => {
                         if respond_to.send(result).is_err() {
-                            tracing::warn!("submit client dropped before response was sent");
+                            tracing::warn!(
+                                "submit HTTP client disconnected before receipt response was sent"
+                            );
                         }
                     }
                     else => break,
@@ -100,14 +102,35 @@ async fn submit_and_wait(
     receipt_rx: oneshot::Receiver<TransactionReceipt>,
     wait_timeout: Duration,
 ) -> AppResult<SubmitTransactionResponse> {
+    let sender = tx.transaction().sender();
     if let Err(error) = mempool.submit_transaction(&tx).await {
         submit_wait.cancel(digest_hex);
+        tracing::warn!(
+            digest = digest_hex,
+            sender = %sender,
+            error = %error,
+            "mempool submit failed"
+        );
         return Err(error);
     }
 
+    tracing::info!(
+        digest = digest_hex,
+        sender = %sender,
+        wait_timeout_ms = wait_timeout.as_millis(),
+        "mempool submit accepted; waiting for receipt"
+    );
+
     match tokio::time::timeout(wait_timeout, receipt_rx).await {
         Ok(Ok(receipt)) => {
-            tracing::debug!(digest = digest_hex, "transaction receipt received via indexer");
+            tracing::info!(
+                digest = digest_hex,
+                sender = %sender,
+                block_num = receipt.block_num,
+                success = receipt.is_success(),
+                event_count = receipt.event_count(),
+                "submit receipt received; ready for HTTP response"
+            );
             Ok(SubmitTransactionResponse {
                 digest: digest_hex.to_string(),
                 receipt,
@@ -115,12 +138,23 @@ async fn submit_and_wait(
         }
         Ok(Err(_)) => {
             submit_wait.cancel(digest_hex);
+            tracing::warn!(
+                digest = digest_hex,
+                sender = %sender,
+                "submit waiter dropped before receipt arrived"
+            );
             Err(AppError::Internal(format!(
                 "submit waiter dropped for transaction {digest_hex}"
             )))
         }
         Err(_) => {
             submit_wait.cancel(digest_hex);
+            tracing::warn!(
+                digest = digest_hex,
+                sender = %sender,
+                wait_timeout_ms = wait_timeout.as_millis(),
+                "timed out waiting for transaction receipt"
+            );
             Err(AppError::Timeout(format!(
                 "timed out waiting for transaction {digest_hex} to be committed"
             )))
