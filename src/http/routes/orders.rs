@@ -14,6 +14,21 @@ use crate::indexer::{apply_order_created_to_book, index_order_created, publish_u
 use crate::spot_market::normalize_spot_market_key;
 use crate::state::AppState;
 
+#[derive(Debug, Deserialize)]
+struct IndexFromEventRequest {
+    event: OrderCreatedEvent,
+    #[serde(default)]
+    skip_book: bool,
+    #[serde(default = "default_open_status")]
+    status: String,
+    #[serde(default)]
+    filled_raw: u64,
+}
+
+fn default_open_status() -> String {
+    "open".into()
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_orders))
@@ -144,11 +159,21 @@ async fn mark_cancelled(
     Path(id): Path<Uuid>,
     Query(query): Query<CancelContextQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (_, chain_order_id, spot_market) = state
+    let (order, chain_order_id, spot_market) = state
         .index
-        .order_cancel_context(id, &query.user_address)
+        .stored_order_context_by_id(id, &query.user_address)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("open order {id} not found")))?;
+        .ok_or_else(|| AppError::NotFound(format!("order {id} not found")))?;
+
+    if order.status == "cancelled" {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
+    if order.status != "open" && order.status != "partial_filled" {
+        return Err(AppError::BadRequest(format!(
+            "order {id} is not cancellable"
+        )));
+    }
 
     state
         .index
@@ -159,15 +184,29 @@ async fn mark_cancelled(
 
 async fn index_from_event(
     State(state): State<AppState>,
-    Json(event): Json<OrderCreatedEvent>,
+    Json(body): Json<serde_json::Value>,
 ) -> AppResult<Json<Order>> {
+    let request: IndexFromEventRequest = if body.get("event").is_some() {
+        serde_json::from_value(body)
+            .map_err(|error| AppError::BadRequest(format!("invalid index request: {error}")))?
+    } else {
+        IndexFromEventRequest {
+            event: serde_json::from_value(body)
+                .map_err(|error| AppError::BadRequest(format!("invalid order event: {error}")))?,
+            skip_book: false,
+            status: default_open_status(),
+            filled_raw: 0,
+        }
+    };
+
+    let event = request.event;
     let chain_order_id = event.order_id.to_string();
     let spot_market = normalize_spot_market_key(&event.market.to_string());
     let is_new = !state
         .index
         .has_chain_order(&spot_market, &chain_order_id)
         .await;
-    if is_new {
+    if is_new && !request.skip_book {
         apply_order_created_to_book(
             &state.book_store,
             &state.index,
@@ -178,9 +217,14 @@ async fn index_from_event(
         .await;
     }
 
-    let order = index_order_created(&state.index, event, &spot_market)
-        .await
-        .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;
+    let order = index_order_created(
+        &state.index,
+        event,
+        &spot_market,
+        Some((request.status, request.filled_raw)),
+    )
+    .await
+    .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;
     if is_new {
         publish_user_order_created(
             &state.user_hub,

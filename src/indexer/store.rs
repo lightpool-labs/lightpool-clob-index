@@ -321,6 +321,29 @@ impl IndexStore {
         ))
     }
 
+    pub async fn stored_order_context_by_id(
+        &self,
+        order_id: Uuid,
+        user_address: &str,
+    ) -> Option<(Order, String, String)> {
+        let inner = self.inner.read().await;
+        let stored = inner.orders.get(&order_id)?;
+        if !stored.user_address.eq_ignore_ascii_case(user_address) {
+            return None;
+        }
+        let market = inner.markets.get(&stored.order.market_id)?;
+        let spot_market = if stored.order.outcome == "yes" {
+            market.yes_spot_market.clone()
+        } else {
+            market.no_spot_market.clone()
+        };
+        Some((
+            stored.order.clone(),
+            stored.chain_order_id.clone(),
+            spot_market,
+        ))
+    }
+
     pub async fn insert_order(
         &self,
         order: Order,
@@ -328,12 +351,13 @@ impl IndexStore {
         spot_market: &str,
         chain_order_id: String,
         size_raw: u64,
+        filled_raw: u64,
     ) {
         let stored = StoredOrder {
             order: order.clone(),
             user_address,
             chain_order_id: chain_order_id.clone(),
-            filled_raw: 0,
+            filled_raw,
             size_raw,
         };
         let key = chain_order_key(spot_market, &chain_order_id);

@@ -179,7 +179,7 @@ pub async fn process_block(
                                     )
                                     .await;
                                 }
-                                index_order_created(store, created, &spot_market).await;
+                                index_order_created(store, created, &spot_market, None).await;
                                 publish_user_order_created(
                                     user_hub,
                                     store,
@@ -751,6 +751,7 @@ pub async fn index_order_created(
     store: &SharedIndexStore,
     created: OrderCreatedEvent,
     spot_market: &str,
+    status_override: Option<(String, u64)>,
 ) -> Option<Order> {
     let Some((market_id, outcome)) = store.lookup_spot_market(spot_market).await else {
         tracing::warn!(
@@ -784,6 +785,7 @@ pub async fn index_order_created(
         .map(|market| market.slug)
         .unwrap_or_default();
     let normalized_spot = crate::spot_market::normalize_spot_market_key(spot_market);
+    let (status, filled_raw) = status_override.unwrap_or_else(|| ("open".into(), 0));
     let order = Order {
         id: Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
@@ -796,7 +798,7 @@ pub async fn index_order_created(
         side: side.into(),
         price: format_price_pieces(price_raw),
         size: format_token_amount(created.amount),
-        status: "open".into(),
+        status,
     };
 
     tracing::info!(
@@ -813,6 +815,7 @@ pub async fn index_order_created(
             spot_market,
             chain_order_id,
             created.amount,
+            filled_raw,
         )
         .await;
 
